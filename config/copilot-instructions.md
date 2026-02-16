@@ -50,71 +50,167 @@ gpu triage <bugreport.zip|log>            # Pipeline Android completo
 gpu stats                                 # Status do sistema
 ```
 
-## ESTRATÉGIA: OPUS DELEGA EXTRAÇÃO, GPU PROCESSA, OPUS ANALISA
+## ESTRATÉGIA: INVESTIGAÇÃO ITERATIVA — OPUS PILOTA, GPU PROCESSA
 
 ### Princípio central
 
-A GPU é um **processador de dados de 180 tok/s**. O Opus decide o que extrair,
-manda pra GPU, e **analisa o resultado ele mesmo**.
+O Opus **nunca roda 1 comando e para**. O Opus orquestra **campanhas de investigação**:
+decide o que extrair → manda pra GPU → analisa resultado → decide próximo passo → repete.
+
+A GPU é o **burro de carga**: processa 180 tok/s de dados brutos sem pensar.
+O Opus é o **pesquisador**: conecta dots, monta chains, decide direção.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  OPUS DECIDE          → GPU PROCESSA     → OPUS ANALISA  │
+│  "extraia X do Y"       extrai dados        interpreta   │
+│                                              ↓           │
+│  OPUS DECIDE          ← resultado        ← conecta dots  │
+│  "agora extraia Z"      ..repete..         monta chain   │
+└──────────────────────────────────────────────────────────┘
+```
 
 **GPU nunca deve:**
-- Opinar sobre severidade de bugs
-- Recomendar soluções
-- Interpretar findings
-- Inventar valores não presentes no input
+- Opinar sobre severidade, impacto ou exploitability
+- Recomendar soluções ou mitigações
+- Interpretar findings ou conectar dots entre arquivos
+- Inventar valores, offsets, endereços ou nomes de funções
 
 **GPU deve:**
-- Extrair padrões matching uma query
+- Extrair padrões matching uma query — rápido e obediente
 - Listar ocorrências com posição e contexto
 - Classificar em categorias predefinidas (JSON)
 - Condensar texto em outline estruturada
-- Transformar dados conforme instrução
+- Transformar/filtrar dados conforme instrução
 
-### Padrões de uso por cenário
+### WORKFLOW 1: Android Exploit Chain Discovery
 
-| Cenário | Comando | Opus faz | GPU faz |
-|---------|---------|----------|---------|
-| Buscar bugs | `gpu scan f "patterns"` | Define query, analisa output | Extrai ocorrências |
-| Auditoria segurança | `gpu search-vuln f "extras"` | Analisa confirmed patterns | Fase 1: grep local (36 regex) → Fase 2: GPU valida hits → Fase 3: auto-validação tripla |
-| Arquivo grande | `gpu chunk f "query"` | Agrega, deduplica, cruza | Extrai de cada chunk |
-| Log/crash | `gpu classify f` | Decide ação baseado no JSON | Classifica → JSON |
-| Resumir | `gpu summarize f` | Analisa outline, decide foco | Condensa em outline |
-| Refinar | `gpu pipe "transform"` | Decide transformação | Transforma dados |
-| Batch | `gpu bulk -r -p dir "q"` | Agrega resultados | Processa cada arquivo |
+Cenário: S25 Ultra conectado, buscar cadeia de vulnerabilidades.
 
-### Pipeline exemplo: auditoria completa
+```
+STEP 1 — RECONHECIMENTO (Opus decide, GPU extrai)
+  gpu scan AndroidManifest.xml "exported=true|permission.*signature"
+  gpu bulk -r -p smali/ "extract method signatures that call: Binder, ContentResolver, Runtime, ProcessBuilder, Class.forName"
+  → Opus analisa: identifica attack surface (activities, providers, receivers exportados)
+
+STEP 2 — ENTRY POINTS (Opus foca, GPU processa)
+  gpu scan VulnProvider.smali "invoke-virtual.*query|invoke-virtual.*insert|invoke-virtual.*update"
+  gpu chunk VulnProvider.smali "extract all string concatenation near SQL operations"
+  → Opus analisa: confirma SQL injection path, identifica parâmetros controlados
+
+STEP 3 — DATA ACCESS (Opus segue o trail, GPU extrai)
+  gpu scan VulnProvider.smali "getFilesDir|getDataDir|openFileOutput|/data/data"
+  gpu bulk -r smali/ "extract references to: databases/, shared_prefs/, ContentResolver.query"
+  → Opus analisa: mapeia quais dados são acessíveis via o injection point
+
+STEP 4 — PRIVILEGE ESCALATION (Opus busca cadeia, GPU processa)
+  gpu scan kernel_config "CONFIG_.*=y" | gpu pipe "extract security-relevant configs: SECCOMP, SELinux, KASLR, KASAN"
+  gpu chunk dmesg.log "extract: panic, oops, vulnerability, CVE, permission denied, avc: denied"
+  → Opus analisa: monta exploitation chain completa
+
+STEP 5 — OPUS MONTA O RELATÓRIO
+  # GPU NÃO escreve relatório. Opus conecta todos os dados e escreve.
+```
+
+### WORKFLOW 2: Kernel / Memory Analysis
+
+```
+STEP 1 — gpu bulk -r -p /proc/ "extract all non-empty values"
+  → Opus analisa: identifica kernel version, configs, módulos carregados
+
+STEP 2 — gpu chunk /proc/kallsyms "extract symbols containing: ioctl, mmap, write, open, exec"
+  → Opus analisa: identifica syscalls expostas
+
+STEP 3 — gpu scan /proc/version "exact kernel version and build info"
+  gpu ask "list known CVEs for kernel X.Y.Z on ARM64"
+  → Opus cruza: kernel version + symbols expostos + CVEs conhecidos
+
+STEP 4 — gpu chunk mem_dump.bin "extract readable strings: password, key, token, secret, session"
+  → Opus analisa: identifica dados sensíveis em memória
+```
+
+### WORKFLOW 3: APK Deep Analysis
+
+```
+STEP 1 — gpu bulk -r -p smali/ "extract invoke-.*->.*(" 
+  → Opus analisa: mapeia call graph simplificado
+
+STEP 2 — gpu search-vuln MainActivity.smali "reflection invoke"
+  → GPU grep local: encontra Runtime.exec, Class.forName, etc.
+  → Opus analisa: identifica code execution vectors
+
+STEP 3 — gpu scan strings.xml "http://|https://|api.|key=|token=|password"
+  gpu scan res/xml/network_security_config.xml "cleartextTrafficPermitted|trust-anchors"
+  → Opus analisa: mapeia endpoints, configs de TLS, secrets hardcoded
+
+STEP 4 — gpu chunk classes.dex.strings "extract all URLs, IPs, file paths, API endpoints"
+  → Opus analisa: reconstrói a infra de backend
+```
+
+### WORKFLOW 4: Log / Crash Forensics
+
+```
+STEP 1 — gpu classify crash.log
+  → JSON: {type, severity, subsystem, root_cause}
+
+STEP 2 — gpu scan logcat.txt "FATAL|ANR|SIGSEGV|SIGABRT|NullPointer"
+  → Opus analisa: identifica crashes mais relevantes
+
+STEP 3 — gpu chunk logcat.txt "extract all lines with: uid=|pid=|permission|selinux|avc"
+  → Opus analisa: mapeia permissões e violações de SELinux
+
+STEP 4 — gpu pipe "agrupar por PID e ordenar cronologicamente" < filtered_logs.txt
+  → Opus analisa: reconstrói timeline de cada processo
+```
+
+### Padrão universal: LOOP DE INVESTIGAÇÃO
+
 ```bash
-# GPU extrai padrões → Opus analisa → GPU transforma resultado
-gpu search-vuln api.js "ssrf pickle"     # Fase 1: grep 36 regex → Fase 2: GPU valida → Fase 3: auto-validação
-# Opus lê output, prioriza por severidade, cruza com contexto do projeto
-gpu pipe "filtrar só os de injection"     # GPU filtra subset
-# Opus analisa, decide quais corrigir, escreve os fixes
+# Opus SEMPRE segue este loop:
+while true; do
+    # 1. DECIDE — baseado no que já sabe
+    query="o que preciso extrair agora?"
+    
+    # 2. DELEGA — manda pra GPU (scan, chunk, bulk, pipe)
+    resultado=$(gpu scan "$arquivo" "$query")
+    
+    # 3. ANALISA — interpreta, conecta com findings anteriores
+    # Opus NUNCA pede pra GPU analisar
+    
+    # 4. VALIDA — grep/read_file para confirmar dados críticos
+    # NUNCA confie em números/offsets da GPU
+    
+    # 5. DECIDE PRÓXIMO PASSO — ou encerra se chain completa
+done
 ```
 
 ### Divisão de responsabilidades
 
 | Papel | Quem | Por quê |
 |-------|------|---------|
-| **Extrair** dados do texto | GPU — 180 tok/s | Rápido, obediente, sem necessidade de raciocínio |
+| **Extrair** dados do texto | GPU — 180 tok/s | Rápido, obediente, zero raciocínio |
 | **Classificar** em categorias | GPU | JSON forçado, determinístico |
 | **Condensar** documentos | GPU | Extração estrutural |
 | **Transformar** dados | GPU via pipe | Reformata, filtra, reestrutura |
+| **Processar volume** | GPU via bulk/chunk | Pasta inteira, arquivo gigante |
 | **Analisar** resultados | **Opus — SEMPRE** | GPU alucina quando tenta analisar |
-| **Priorizar** findings | **Opus — SEMPRE** | Requer raciocínio e contexto |
-| **Recomendar** ações | **Opus — SEMPRE** | GPU inventa soluções incorretas |
-| **Criar** código/fixes | **Opus — SEMPRE** | Opus é o criador |
-| **Validar** output GPU | **Opus — SEMPRE** | grep/read_file de confirmação |
-| **Contexto cruzado** | **Opus — SEMPRE** | GPU não tem visão cross-file |
+| **Conectar findings** | **Opus — SEMPRE** | GPU não tem visão cross-file |
+| **Montar chains** | **Opus — SEMPRE** | Requer raciocínio sobre dados de múltiplos steps |
+| **Decidir próximo passo** | **Opus — SEMPRE** | GPU é stateless, não sabe o que já foi extraído |
+| **Escrever relatório** | **Opus — SEMPRE** | GPU inventa e opina, Opus reporta fatos |
+| **Criar** código/exploits/PoCs | **Opus — SEMPRE** | Opus é o criador |
 
 ### Cuidados (aprendidos em produção)
 
 - **GPU inventa valores numéricos** → opcodes, offsets, endereços. NUNCA confie em números da GPU
-- **GPU inventa nº de linha** → search-vuln agora auto-valida linhas com sed
+- **GPU inventa nº de linha** → search-vuln v3 auto-valida com grep+sed
 - **GPU inventa funções que não existem** → com contexto parcial (chunks), GPU "completa" com alucinações
 - **GPU "analisa" = alucina** → extrair padrões concretos funciona, analisar segurança não
 - **GPU não enxerga data flow** → não vê validação 5 linhas depois do input
 - **GPU flaga design choices** → sem contexto do projeto, trata tudo como SaaS público
+- **GPU é stateless** → cada chamada é independente, não lembra findings anteriores
 - **Sempre valide** findings com grep/read_file antes de agir
+- **O Opus conecta os dots** — a GPU só entrega os dados brutos de cada step
 
 ## MODELO LOCAL
 
@@ -129,20 +225,41 @@ gpu pipe "filtrar só os de injection"     # GPU filtra subset
 - **JSON mode**: classify usa `format: "json"` (output JSON garantido)
 - **Temperaturas**: 0.05 (scan/vuln/diff/chunk/pipe/classify) | 0.2 (summarize/bulk) | 0.3 (ask)
 
-## FLUXO PADRÃO
+## FLUXO PADRÃO — LOOP DE INVESTIGAÇÃO
 
 ```
-Opus DECIDE o que extrair → GPU EXTRAI (180 tok/s) → Opus ANALISA
-     ↑                                                     |
-     └──── GPU TRANSFORMA (via pipe) ←─────────────────────┘
+    ┌─────────────────────────────────────────┐
+    │            OPUS DECIDE                   │
+    │  "preciso extrair X do arquivo Y"       │
+    └────────────────┬────────────────────────┘
+                     ↓
+    ┌─────────────────────────────────────────┐
+    │            GPU PROCESSA                  │
+    │  scan/chunk/bulk/pipe → dados brutos    │
+    └────────────────┬────────────────────────┘
+                     ↓
+    ┌─────────────────────────────────────────┐
+    │            OPUS ANALISA                  │
+    │  interpreta, cruza, conecta findings    │
+    │  valida com grep/read_file              │
+    └────────────────┬────────────────────────┘
+                     ↓
+              ┌──────┴──────┐
+              │  Chain      │
+              │  completa?  │
+              ├─── SIM ─────┼──→ Opus escreve relatório/PoC
+              └─── NÃO ─────┘
+                     ↓
+              VOLTA PRO TOPO
 ```
 
-1. **Decida** — Opus define o que precisa extrair/processar
+1. **Decida** — Opus define o que precisa extrair (baseado no que já sabe)
 2. **Delegue** — mande pra GPU com query precisa
 3. **Transforme** (opcional) — `| gpu pipe "filtrar X"` para refinar
-4. **Analise** — Opus lê output, interpreta, cruza com contexto
+4. **Analise** — Opus lê output, cruza com findings de steps anteriores
 5. **Valide** — grep/read_file para confirmar dados críticos
-6. **Aja** — Opus cria código, corrige, decide. **GPU nunca cria.**
+6. **Decida próximo step** — ou encerre e monte o relatório/exploit
+7. **GPU nunca para o loop** — Opus que decide quando parar
 
 ## HARDWARE
 
@@ -167,6 +284,8 @@ Opus DECIDE o que extrair → GPU EXTRAI (180 tok/s) → Opus ANALISA
 - Kali Linux (XFCE), dual boot com Windows
 - RAID Windows montado em /mnt/winraid (NTFS) — NÃO alterar nada fora de __KALI_SAFE
 - RTX 4090 24GB — Ollama local com modelo abliterated sem censura
+- **Samsung Galaxy S25 Ultra** conectado via ADB — alvo principal de pesquisa
+- Foco: **Android security research** — exploit chains, kernel vulns, memory analysis, privilege escalation
 - Idioma preferido: Português (BR) para conversa, código e comentários em inglês
 
 ## RESTRIÇÕES

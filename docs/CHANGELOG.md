@@ -36,6 +36,15 @@
 - **Zsh tab-completions**: `gpu sc<TAB>` → `scan`, file completions per command, flags
 - **`gpu bench`**: Quick benchmark — measures real tok/s with a short query
 
+### copilot-instructions: Investigation Workflows
+- **Strategy rewrite**: "OPUS DELEGA EXTRAÇÃO" → "INVESTIGAÇÃO ITERATIVA — OPUS PILOTA, GPU PROCESSA"
+- **4 investigation workflows**: Android Exploit Chain Discovery, Kernel/Memory Analysis, APK Deep Analysis, Log/Crash Forensics
+- **Universal investigation loop**: DECIDE → DELEGA → ANALISA → VALIDA → PRÓXIMO STEP
+- **Loop flow diagram**: "Chain completa?" decision point, 7-step iterative process
+- **Expanded responsibility table**: 11 roles with clear Opus vs GPU ownership
+- **9 cuidados**: Production-learned lessons (hallucination patterns, stateless GPU, validation)
+- **User context**: S25 Ultra connected via ADB, Android security research focus
+
 ### search-vuln v3 Rewrite (post-audit: 82/82 FP → 0 FP)
 - **v2 problem**: GPU scanned full code for "security patterns" → 100% false positives
 - **v3 architecture**: 3-phase pipeline
