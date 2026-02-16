@@ -36,6 +36,14 @@
 - **Zsh tab-completions**: `gpu sc<TAB>` → `scan`, file completions per command, flags
 - **`gpu bench`**: Quick benchmark — measures real tok/s with a short query
 
+### search-vuln Rewrite (post-audit: 100% FP rate)
+- **Root cause**: prompt asked GPU to "analyze" security — violated processor philosophy
+- **Rewritten**: now searches for **concrete patterns only** (eval, exec, innerHTML, SQL concat, hardcoded secrets, etc.)
+- **Auto-validation**: every LINE: cited by GPU is verified against the real file via sed
+- **No more**: severity assessment, impact analysis, recommendations, "missing X" findings
+- **Output**: LINE + CODE + REAL (what GPU said vs what's actually there)
+- **Eliminated**: category/severity fields, architectural opinion, "design choice" flags
+
 ### Rating: 10/10
 
 ---

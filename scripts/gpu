@@ -587,33 +587,34 @@ cmd_triage() {
 
 cmd_search_vuln() {
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu search-vuln <arquivo> \"contexto\""; exit $EX_USAGE; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu search-vuln <arquivo> \"padrões extras\""; exit $EX_USAGE; }
     shift
-    local context="${*:-general security audit}"
+    local extra_patterns="${*:-}"
 
     require_file "$file"
     ensure_ollama
 
     local size
     size=$(file_size_human "$file")
-    log_info "Vulnerability scan: $(basename "$file") (${size}) | Context: ${context}"
+    local total_lines
+    total_lines=$(wc -l < "$file")
+    log_info "Pattern extraction: $(basename "$file") (${size}, ${total_lines}L)"
 
     # Auto-redirect para chunk se arquivo não cabe no contexto
     local file_bytes
     file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
     if (( file_bytes > CHARS_VULN )); then
         log_warn "Arquivo excede contexto ($(( file_bytes / 1024 ))KB > $(( CHARS_VULN / 1024 ))KB) — redirecionando para chunk"
-        cmd_chunk "$file" "Extract all security-relevant patterns: eval/exec calls, SQL concatenation, unsanitized input, hardcoded keys/tokens, open permissions, missing auth checks, unsafe deserialization, command injection, path traversal. Context: ${context}"
+        cmd_chunk "$file" "Extract ONLY these exact code patterns (quote the code, give line number): eval() exec() child_process spawn() Function() setTimeout(string) setInterval(string) innerHTML outerHTML document.write insertAdjacentHTML sql/query with string concatenation (+ instead of parameterized) hardcoded passwords/keys/tokens/secrets rejectUnauthorized:false fs operations with user input deserialization of untrusted data. ${extra_patterns:+Also: ${extra_patterns}.} If a pattern does not appear in the code, do NOT mention it."
         return $?
     fi
 
-    # Contexto expandido para vuln research
     local content
     content=$(smart_extract "$file" "$CHARS_VULN")
 
-    # Cache: mesma auditoria no mesmo arquivo = mesmo resultado
+    # Cache
     local ckey
-    ckey=$(cache_key "$file" "vuln_$(echo "$context" | md5sum | cut -c1-8)" "$MODEL")
+    ckey=$(cache_key "$file" "vuln2_$(echo "$extra_patterns" | md5sum | cut -c1-8)" "$MODEL")
     if cache_get "$ckey"; then
         return 0
     fi
@@ -621,25 +622,81 @@ cmd_search_vuln() {
     _timer_start
     local result
     result=$(ollama_query \
-        "${EXTRACT_RULE} Extract all security-relevant patterns from the code. For each finding output:
-- **Pattern**: the exact code snippet (quote it)
-- **Location**: line number or function name
-- **Category**: input_validation | access_control | crypto | config | info_exposure | error_handling | race_condition | hardcoded_creds | injection | other
+        "${EXTRACT_RULE} You are a pattern matcher. Search the code for ONLY these concrete patterns:
 
-Patterns to extract: eval/exec calls, SQL concatenation, unsanitized user input, hardcoded passwords/keys/tokens, open permissions, missing auth checks, unsafe deserialization, command injection vectors, path traversal, TOCTOU patterns.
+MUST FIND (if present):
+- eval(), exec(), execSync(), child_process.spawn/exec with variable args
+- Function(), setTimeout(string), setInterval(string)
+- innerHTML, outerHTML, document.write, insertAdjacentHTML with variables
+- SQL/query with string concatenation (+ or template literals instead of \$1/\$2/?)
+- Hardcoded strings that look like passwords, API keys, tokens, secrets (not env vars)
+- rejectUnauthorized: false, NODE_TLS_REJECT_UNAUTHORIZED
+- fs.readFile/writeFile/unlink with req.params/req.query/req.body (path traversal)
+- JSON.parse of untrusted input without try/catch
+- deserialization: unserialize(), pickle.loads(), yaml.load() without SafeLoader
+${extra_patterns:+- ALSO SEARCH: ${extra_patterns}}
 
-Do NOT assess severity or recommend fixes — just extract the raw patterns and their locations." \
-        "Security code review of: $(basename "$file")
-Context: ${context}
-File type: $(file -b "$file" 2>/dev/null || echo unknown)
+OUTPUT FORMAT (for each match):
+LINE: <number>
+CODE: <exact line of code, copied verbatim>
+NEXT: <the line after, verbatim>
 
---- CONTENT ---
-${content}
---- END ---" \
+RULES:
+- If a pattern does NOT appear in the code, do NOT mention it at all
+- Do NOT invent functions or code that is not in the input
+- Do NOT assess severity, impact, or recommend fixes
+- Do NOT flag env var fallbacks, config choices, or architectural decisions
+- ONLY output patterns you can QUOTE from the input text
+- If zero patterns found, output: NO PATTERNS FOUND" \
+        "File: $(basename "$file") ($(file -b "$file" 2>/dev/null || echo unknown))
+
+${content}" \
         "$PREDICT_VULN" \
         "$TEMP_DETERMINISTIC")
-    echo "$result"
-    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+
+    # ─── Auto-validação: verifica linha citada contra arquivo real ───
+    if [[ -n "$result" ]]; then
+        local validated=""
+        local found=0 verified=0 failed=0
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^LINE:\ *([0-9]+) ]]; then
+                found=$((found + 1))
+                local lnum="${BASH_REMATCH[1]}"
+                local real_line
+                real_line=$(sed -n "${lnum}p" "$file" 2>/dev/null)
+                # Lê a próxima linha do output (CODE:)
+                IFS= read -r code_line || true
+                if [[ -n "$real_line" ]]; then
+                    verified=$((verified + 1))
+                    validated+="LINE: ${lnum}
+CODE: ${code_line#CODE: }
+REAL: ${real_line}
+"
+                else
+                    failed=$((failed + 1))
+                    validated+="LINE: ${lnum} ⚠️ INVALID (file has ${total_lines} lines)
+"
+                fi
+            fi
+        done <<< "$result"
+
+        if (( found > 0 )); then
+            log_info "Auto-validação: ${verified}/${found} linhas verificadas, ${failed} inválidas"
+            echo "## Pattern Extraction: $(basename "$file")"
+            echo ""
+            echo "$result"
+            echo ""
+            echo "---"
+            echo "## Auto-Validation (real lines from file)"
+            echo ""
+            echo "$validated"
+        else
+            echo "$result"
+        fi
+        cache_put "$ckey" "$result"
+    else
+        echo "NO PATTERNS FOUND"
+    fi
     _timer_end
 }
 
@@ -1227,7 +1284,7 @@ case "$CMD" in
         echo "  gpu classify <file>                  Classifica crash/log (JSON forçado)"
         echo "  gpu summarize <file>                 Resume arquivo grande"
         echo "  gpu triage <bugreport.zip|log>       Pipeline completo Android"
-        echo "  gpu search-vuln <file> \"contexto\"    Auditoria de segurança"
+        echo "  gpu search-vuln <file> \"extras\"    Extrai padrões de risco (concretos, com validação)"
         echo "  gpu bulk [-r] [-p] <dir> \"instrução\" Processa pasta (-p = paralelo)"
         echo "  gpu chunk <file> \"instrução\" [lines] [overlap] Auto-fatia + paralelo + agrega"
         echo "  gpu pipe \"instrução\"                 Pipeline: stdin → GPU → stdout"
@@ -1240,7 +1297,7 @@ case "$CMD" in
         echo "  gpu ask \"how to decode base64 in python\""
         echo "  gpu scan crash.log \"null pointer\""
         echo "  gpu summarize /var/log/syslog"
-        echo "  gpu search-vuln app.py \"REST API\""
+        echo "  gpu search-vuln app.py \"ssrf pickle\"  # padrões extras"
         echo "  gpu bulk -r -p src/ \"extract TODO comments\""
         echo "  gpu chunk bigfile.js \"extract bugs\" 800"
         echo "  gpu chunk bigfile.js \"extract bugs\" 800 100  # 800L chunks, 100L overlap"

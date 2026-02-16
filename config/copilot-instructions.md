@@ -37,7 +37,7 @@ gpu ask "pergunta"                        # Único comando onde GPU "pensa" (tem
 gpu scan <arquivo> "o que extrair"        # Extrai ocorrências matching query
 gpu classify <arquivo>                    # Classifica crash/log → JSON puro
 gpu summarize <arquivo>                   # Condensa documento em outline
-gpu search-vuln <arquivo> "contexto"      # Extrai padrões de risco (não analisa)
+gpu search-vuln <arquivo> "extras"      # Extrai padrões concretos (eval, exec, innerHTML, SQL concat...)
 gpu diff <file1> <file2> "foco"           # Extrai diferenças estruturais
 
 # ─── Processamento em escala ───
@@ -75,7 +75,7 @@ manda pra GPU, e **analisa o resultado ele mesmo**.
 | Cenário | Comando | Opus faz | GPU faz |
 |---------|---------|----------|---------|
 | Buscar bugs | `gpu scan f "patterns"` | Define query, analisa output | Extrai ocorrências |
-| Auditoria segurança | `gpu search-vuln f "ctx"` | Prioriza por CVSS, decide ação | Extrai padrões de risco |
+| Auditoria segurança | `gpu search-vuln f "extras"` | Prioriza por CVSS, decide ação | Extrai padrões concretos (eval, SQL concat...) |
 | Arquivo grande | `gpu chunk f "query"` | Agrega, deduplica, cruza | Extrai de cada chunk |
 | Log/crash | `gpu classify f` | Decide ação baseado no JSON | Classifica → JSON |
 | Resumir | `gpu summarize f` | Analisa outline, decide foco | Condensa em outline |
@@ -85,7 +85,7 @@ manda pra GPU, e **analisa o resultado ele mesmo**.
 ### Pipeline exemplo: auditoria completa
 ```bash
 # GPU extrai padrões → Opus analisa → GPU transforma resultado
-gpu search-vuln api.js "REST API"        # GPU extrai: eval(), SQL concat, etc
+gpu search-vuln api.js "ssrf pickle"     # GPU extrai: eval(), SQL concat, etc (com auto-validação)
 # Opus lê output, prioriza por severidade, cruza com contexto do projeto
 gpu pipe "filtrar só os de injection"     # GPU filtra subset
 # Opus analisa, decide quais corrigir, escreve os fixes
@@ -109,8 +109,11 @@ gpu pipe "filtrar só os de injection"     # GPU filtra subset
 ### Cuidados (aprendidos em produção)
 
 - **GPU inventa valores numéricos** → opcodes, offsets, endereços. NUNCA confie em números da GPU
-- **GPU inventa nº de linha** → chunks têm header com range real, quotes do texto original
-- **GPU "analisa" = alucina** → extrair padrões funciona, analisar não
+- **GPU inventa nº de linha** → search-vuln agora auto-valida linhas com sed
+- **GPU inventa funções que não existem** → com contexto parcial (chunks), GPU "completa" com alucinações
+- **GPU "analisa" = alucina** → extrair padrões concretos funciona, analisar segurança não
+- **GPU não enxerga data flow** → não vê validação 5 linhas depois do input
+- **GPU flaga design choices** → sem contexto do projeto, trata tudo como SaaS público
 - **Sempre valide** findings com grep/read_file antes de agir
 
 ## MODELO LOCAL
