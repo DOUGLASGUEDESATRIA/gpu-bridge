@@ -48,11 +48,15 @@ Abliterated (huihui_ai) remove censura no nível dos weights — não é jailbre
 
 ## Por que Temperatures Diferentes?
 
-Cada tipo de tarefa precisa de trade-off diferente:
-- **classify (0.05)**: Precisa de JSON consistente, zero criatividade
-- **scan/vuln/diff (0.1)**: Precisa ser preciso mas pode variar formatação
-- **summarize/bulk (0.2)**: Precisa sintetizar, alguma liberdade
-- **ask (0.3)**: Conversa geral, mais liberdade criativa
+v6.1 simplificou de 4 para 3 tiers. Razão: GPU é processadora, não analista —
+extração precisa temperatura mínima, não "alguma precisão".
+
+- **extract (0.05)**: scan, vuln, diff, chunk, pipe, classify — extração determinística
+- **condense (0.2)**: summarize, bulk — condensação precisa de alguma liberdade para sintetizar
+- **creative (0.3)**: ask — único comando onde GPU "pensa"
+
+Antes (v6.0) existia `Analytical (0.1)` — eliminado porque extração não precisa
+de criatividade. Quanto mais baixa a temperatura, mais obediente e precisa a extração.
 
 ## Por que Auto-Chunk em vez de Rejeitar Arquivos Grandes?
 
@@ -66,6 +70,30 @@ Antes (v5.x): "arquivo grande → delega para Opus" (GPU ociosa).
 Agora (v6.0): "arquivo grande → Opus fatia → GPU processa tudo → Opus raciocina sobre resultado".
 
 O overlap entre chunks (50 linhas por padrão) garante que bugs em fronteiras não sejam perdidos.
+
+## Por que GPU = Processador Puro (v6.1)?
+
+Aprendemos em produção que GPU (Qwen) **alucina quando tenta analisar**:
+- Inventa opcodes/offsets com confiança (valores numéricos fabricados)
+- Opina com autoridade sobre coisas erradas
+- Seu raciocínio arquitetural pode ser correto, mas dados concretos são inventados
+
+Solução: GPU é um **grep inteligente a 180 tok/s**. Ela:
+- **EXTRAI** padrões do texto (funciona perfeitamente)
+- **FILTRA** dados conforme instrução
+- **TRANSFORMA** formato dos dados
+- **CLASSIFICA** em categorias predefinidas (JSON forçado)
+- **CONDENSA** documentos em outlines
+
+Ela **NUNCA**:
+- Analisa, opina ou recomenda
+- Inventa valores não presentes no input
+- Julga severidade ou prioriza findings
+
+Isso é formalizado no `EXTRACT_RULE` — uma constante injetada em todos os system prompts
+de processamento, que instrui a GPU a ser um processador de dados, não um analista.
+
+Opus é o ÚNICO que analisa, raciocina, prioriza e cria.
 
 ## Por que Pipeline (stdin→GPU→stdout)?
 

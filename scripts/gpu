@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
-# gpu v6.0 — Bridge Híbrida: Opus (orquestrador) ↔ RTX 4090 (motor de processamento)
+# gpu v6.1 — Bridge Híbrida: Opus (cérebro) ↔ RTX 4090 (processador de dados)
 # ============================================================================
 #
 # ARQUITETURA HÍBRIDA:
-#   Opus (Copilot) RACIOCINA → gpu EXECUTA → Opus LÊ resultado → Opus DECIDE
+#   Opus DECIDE o que extrair → GPU EXTRAI dados (180 tok/s) → Opus ANALISA resultado
 #
 # MODELO ÚNICO — Qwen3-Coder-30B-MoE abliterated:
 #   • 30B params totais, 128 experts, 3.3B ativados por token
@@ -13,22 +13,10 @@
 #   • 32K context window ativo (256K nativo, 32K = sweet spot VRAM)
 #   • Override: GPU_MODEL=modelo gpu comando
 #
-# v6.0 Mudanças:
-#   - NEW: gpu chunk — auto-fatia arquivos grandes + processamento paralelo + agregação
-#   - NEW: gpu pipe — pipeline encadeado (stdin → GPU → stdout)
-#   - NEW: gpu bulk -p — modo paralelo (2 workers simultâneos)
-#   - FIX: smart_extract agora usa head+middle+tail (não perde o meio)
-#   - FIX: classify força output JSON via Ollama format parameter
-#   - FIX: ollama_query suporta $5=format (json)
-#
-# v5.0 Mudanças:
-#   - Context window: 8K → 32K (4x mais conteúdo, zero perda de speed)
-#   - Content limits: 2-3x maiores em todos os comandos
-#   - Keep Alive: infinito (modelo nunca descarrega — é o único)
-#   - Cache expandido: scan, search-vuln, diff agora com cache
-#   - Temperature por comando (0.05 classify → 0.3 ask)
-#   - Retry automático (1x) em falhas transitórias
-#   - GPU Persistence Mode via systemd
+# v6.1: GPU = processador puro (EXTRACT_RULE), temperaturas 4→3 tiers, all prompts rewritten
+# v6.0: Auto-chunk, pipe, bulk paralelo, smart_extract head+mid+tail, classify JSON
+# v5.0: 32K ctx, KEEP_ALIVE=-1, retry, temperatures, cache expansion
+# Full changelog: docs/CHANGELOG.md
 #
 # Modos:
 #   gpu ask "pergunta qualquer"              → resposta rápida
@@ -48,8 +36,17 @@
 
 set -euo pipefail
 
+# ─── Exit codes ─────────────────────────────────────────────────────────────────
+EX_OK=0
+EX_GENERIC=1            # erro genérico
+EX_FILE=2               # arquivo não encontrado / binário / sem permissão
+EX_OLLAMA=3             # ollama offline / modelo indisponível
+EX_TIMEOUT=4            # timeout na query
+EX_USAGE=5              # argumento faltando / uso incorreto
+
 # ─── Config ─────────────────────────────────────────────────────────────────
-VERSION="6.0"
+NO_CACHE=false          # --no-cache flag: força reprocessamento
+VERSION="6.1"
 KALI_SAFE="/mnt/winraid/__KALI_SAFE"
 export OLLAMA_MODELS="${KALI_SAFE}/models"
 HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
@@ -74,23 +71,28 @@ mkdir -p "$CACHE_DIR" 2>/dev/null || true
 # Formula: (NUM_CTX - system_prompt_tokens - predict_tokens) * ~3.5 chars/token
 CHARS_SMALL=8000        # classify, ask (sobra margem para system prompt longo)
 CHARS_MEDIUM=48000      # scan (32K ctx = ~28K tokens disponíveis para input)
-CHARS_LARGE=80000       # summarize (maximiza conteúdo analisado)
+CHARS_LARGE=80000       # summarize (maximiza conteúdo processado)
 CHARS_BULK=12000        # bulk (por arquivo, 2x mais que antes)
-CHARS_VULN=64000        # search-vuln (3.2x mais contexto = auditoria profunda)
+CHARS_VULN=64000        # search-vuln (3.2x mais contexto = extração profunda)
 CHARS_DIFF=32000        # diff (cada arquivo = metade do limite)
 
 # Tokens de resposta por comando
 PREDICT_SMALL=512       # classify (JSON curto)
 PREDICT_MEDIUM=1024     # ask, scan
 PREDICT_LARGE=2048      # summarize
-PREDICT_VULN=3072       # search-vuln (relatório detalhado)
+PREDICT_VULN=3072       # search-vuln (extraction output)
 PREDICT_BULK=512        # bulk (por arquivo)
 
 # Temperature por comando (otimizada por tipo de tarefa)
-TEMP_DETERMINISTIC=0.05 # classify — JSON preciso, zero criatividade
-TEMP_ANALYTICAL=0.1     # scan, vuln, diff — análise metódica
-TEMP_BALANCED=0.2       # summarize, bulk — equilíbrio
-TEMP_CREATIVE=0.3       # ask — perguntas abertas, mais natural
+# GPU = processador puro → temperaturas baixas maximizam precisão de extração
+TEMP_DETERMINISTIC=0.05 # classify, scan, vuln, diff, chunk — extração precisa
+TEMP_BALANCED=0.2       # summarize, bulk — condensação com alguma liberdade
+TEMP_CREATIVE=0.3       # ask — único comando onde GPU "pensa"
+
+# Extraction rule: filosofia central da bridge
+# GPU NÃO analisa, NÃO opina, NÃO raciocina. GPU EXTRAI e PROCESSA dados.
+# Opus é quem analisa os resultados. GPU é grep inteligente a 180 tok/s.
+EXTRACT_RULE="ROLE: You are a data processor, not an analyst. RULES: 1) ONLY extract information that exists literally in the input text. 2) NEVER invent values, line numbers, or details not present in the input. 3) NEVER add opinions, interpretations, or recommendations — that is the caller's job. 4) Output raw structured data. 5) If uncertain about a value, omit it rather than guess. 6) Quote the source text when referencing findings."
 
 # ─── Cores (só stderr) ─────────────────────────────────────────────────────
 if [[ -t 2 ]]; then
@@ -148,7 +150,7 @@ ensure_ollama() {
     fi
 
     log_err "FATAL: Não consegui iniciar Ollama em ${HOST}"
-    exit 1
+    exit $EX_OLLAMA
 }
 
 validate_model() {
@@ -158,7 +160,7 @@ validate_model() {
 
     if [[ -z "$available" ]]; then
         log_err "Nenhum modelo disponível no Ollama"
-        exit 1
+        exit $EX_OLLAMA
     fi
 
     if ! echo "$available" | grep -qF "$MODEL"; then
@@ -174,15 +176,15 @@ require_file() {
     local file="$1"
     if [[ ! -f "$file" ]]; then
         log_err "Arquivo não encontrado: $file"
-        exit 1
+        exit $EX_FILE
     fi
     if [[ ! -r "$file" ]]; then
         log_err "Sem permissão de leitura: $file"
-        exit 1
+        exit $EX_FILE
     fi
     if is_binary "$file"; then
         log_err "Arquivo binário não suportado: $file"
-        exit 1
+        exit $EX_FILE
     fi
 }
 
@@ -190,7 +192,7 @@ require_dir() {
     local dir="$1"
     if [[ ! -d "$dir" ]]; then
         log_err "Diretório não encontrado: $dir"
-        exit 1
+        exit $EX_FILE
     fi
 }
 
@@ -231,6 +233,8 @@ smart_extract() {
         # Arquivo inteiro cabe
         cat "$file"
     else
+        # Aviso de truncamento para o Opus saber que houve perda
+        log_warn "Truncado: $(( file_bytes / 1024 ))KB → $(( max_chars / 1024 ))KB ($(( max_chars * 100 / file_bytes ))% do arquivo)"
         # Split: 40% head, 30% middle, 30% tail (não perde o core do arquivo)
         local head_chars=$(( max_chars * 40 / 100 ))
         local mid_chars=$(( max_chars * 30 / 100 ))
@@ -260,18 +264,21 @@ smart_extract() {
     fi
 }
 
-# Cache key baseada em: arquivo + comando + modelo
+# Cache key baseada em: arquivo + comando + modelo + versão do script
+# VERSION no hash garante que mudança de prompts invalida cache antigo
 cache_key() {
     local file="$1"
     local cmd="$2"
     local model="$3"
     local mtime
     mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
-    echo "${cmd}_$(echo "${file}_${mtime}_${model}" | md5sum | cut -c1-16)"
+    echo "${cmd}_$(echo "${file}_${mtime}_${model}_${VERSION}" | md5sum | cut -c1-16)"
 }
 
 cache_get() {
     local key="$1"
+    # --no-cache: ignora cache
+    $NO_CACHE && return 1
     local cache_file="${CACHE_DIR}/${key}.txt"
     if [[ -f "$cache_file" ]]; then
         # Cache válido por 24h
@@ -297,7 +304,7 @@ ollama_query() {
     local system_prompt="$1"
     local user_prompt="$2"
     local num_predict="${3:-$PREDICT_MEDIUM}"
-    local temperature="${4:-$TEMP_ANALYTICAL}"
+    local temperature="${4:-$TEMP_DETERMINISTIC}"
     local format="${5:-}"
 
     log_dim "Modelo: ${MODEL} | ctx:${NUM_CTX} temp:${temperature}$([ -n "$format" ] && echo " fmt:${format}")"
@@ -369,7 +376,7 @@ ollama_query() {
 
     if [[ -z "${raw_response:-}" ]]; then
         log_err "Todas as tentativas falharam. Ollama rodando?"
-        return 1
+        return $EX_TIMEOUT
     fi
 
     # Extrai .response e métricas
@@ -406,7 +413,7 @@ ollama_query() {
 
 cmd_ask() {
     local question="$*"
-    [[ -z "$question" ]] && { log_err "Uso: gpu ask \"pergunta\""; exit 1; }
+    [[ -z "$question" ]] && { log_err "Uso: gpu ask \"pergunta\""; exit $EX_USAGE; }
     ensure_ollama
 
     _timer_start
@@ -420,10 +427,10 @@ cmd_ask() {
 
 cmd_scan() {
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit 1; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit $EX_USAGE; }
     shift
     local query="$*"
-    [[ -z "$query" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit 1; }
+    [[ -z "$query" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit $EX_USAGE; }
 
     require_file "$file"
     ensure_ollama
@@ -433,6 +440,15 @@ cmd_scan() {
     local lines
     lines=$(wc -l < "$file")
     log_info "Scanning ${file} (${size}, ${lines}L) for: ${query}"
+
+    # Auto-redirect para chunk se arquivo não cabe no contexto
+    local file_bytes
+    file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if (( file_bytes > CHARS_MEDIUM )); then
+        log_warn "Arquivo excede contexto ($(( file_bytes / 1024 ))KB > $(( CHARS_MEDIUM / 1024 ))KB) — redirecionando para chunk"
+        cmd_chunk "$file" "$query"
+        return $?
+    fi
 
     local content
     content=$(smart_extract "$file" "$CHARS_MEDIUM")
@@ -447,8 +463,8 @@ cmd_scan() {
     _timer_start
     local result
     result=$(ollama_query \
-        "You scan files for specific patterns. Be precise and thorough. Return findings as a structured list with line references when possible. Mention if the file was truncated and findings might be incomplete." \
-        "Scan this file for: ${query}
+        "${EXTRACT_RULE} Extract all occurrences matching the query. For each match return: the exact line content, line number if visible, and 1-2 lines of surrounding context. Output as a structured list. Do not interpret or judge the findings." \
+        "Extract from this file all occurrences of: ${query}
 
 File: $(basename "$file") | Size: ${size} | Lines: ${lines}
 
@@ -456,7 +472,7 @@ File: $(basename "$file") | Size: ${size} | Lines: ${lines}
 ${content}
 --- END ---" \
         "$PREDICT_MEDIUM" \
-        "$TEMP_ANALYTICAL")
+        "$TEMP_DETERMINISTIC")
     echo "$result"
     [[ -n "$result" ]] && cache_put "$ckey" "$result"
     _timer_end
@@ -464,7 +480,7 @@ ${content}
 
 cmd_classify() {
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu classify <arquivo>"; exit 1; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu classify <arquivo>"; exit $EX_USAGE; }
 
     require_file "$file"
     ensure_ollama
@@ -498,7 +514,7 @@ ${content}" \
 
 cmd_summarize() {
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu summarize <arquivo>"; exit 1; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu summarize <arquivo>"; exit $EX_USAGE; }
 
     require_file "$file"
     ensure_ollama
@@ -508,6 +524,15 @@ cmd_summarize() {
     local lines
     lines=$(wc -l < "$file")
     log_info "Summarizing $(basename "$file") (${size}, ${lines}L)"
+
+    # Auto-redirect para chunk se arquivo não cabe no contexto
+    local file_bytes
+    file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if (( file_bytes > CHARS_LARGE )); then
+        log_warn "Arquivo excede contexto ($(( file_bytes / 1024 ))KB > $(( CHARS_LARGE / 1024 ))KB) — redirecionando para chunk"
+        cmd_chunk "$file" "condense into structured outline, extract main sections and key data points"
+        return $?
+    fi
 
     local content
     content=$(smart_extract "$file" "$CHARS_LARGE")
@@ -522,8 +547,8 @@ cmd_summarize() {
     _timer_start
     local result
     result=$(ollama_query \
-        "You are a technical writer creating an executive summary. Analyze the document and extract the key information, structure, patterns, and notable entries. Present a well-organized summary." \
-        "Create a structured summary of this technical document (${lines} lines total, ${size}). List the main topics covered, key data points, and any items requiring attention:
+        "${EXTRACT_RULE} Condense this document into a structured outline. Extract: main sections/topics, key data points (numbers, names, values), and any items marked as important/critical/TODO/FIXME. Output as a hierarchical list. Do not add interpretation." \
+        "Condense this document (${lines} lines, ${size}) into a structured outline:
 
 ${content}" \
         "$PREDICT_LARGE" \
@@ -535,18 +560,18 @@ ${content}" \
 
 cmd_triage() {
     local input="${1:-}"
-    [[ -z "$input" ]] && { log_err "Uso: gpu triage <bugreport.zip|logfile>"; exit 1; }
+    [[ -z "$input" ]] && { log_err "Uso: gpu triage <bugreport.zip|logfile>"; exit $EX_USAGE; }
 
     if [[ ! -f "$input" ]]; then
         log_err "Arquivo não encontrado: $input"
-        exit 1
+        exit $EX_FILE
     fi
 
     local triage_script="${KALI_SAFE}/scripts/triage.py"
     if [[ ! -f "$triage_script" ]]; then
         log_err "triage.py não encontrado em: $triage_script"
-        log_warn "Alternativa: use 'gpu classify' ou 'gpu summarize' para análise direta"
-        exit 1
+        log_warn "Alternativa: use 'gpu classify' ou 'gpu summarize' para processamento direto"
+        exit $EX_FILE
     fi
 
     log_info "Running full triage pipeline on $(basename "$input")..."
@@ -562,7 +587,7 @@ cmd_triage() {
 
 cmd_search_vuln() {
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu search-vuln <arquivo> \"contexto\""; exit 1; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu search-vuln <arquivo> \"contexto\""; exit $EX_USAGE; }
     shift
     local context="${*:-general security audit}"
 
@@ -572,6 +597,15 @@ cmd_search_vuln() {
     local size
     size=$(file_size_human "$file")
     log_info "Vulnerability scan: $(basename "$file") (${size}) | Context: ${context}"
+
+    # Auto-redirect para chunk se arquivo não cabe no contexto
+    local file_bytes
+    file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if (( file_bytes > CHARS_VULN )); then
+        log_warn "Arquivo excede contexto ($(( file_bytes / 1024 ))KB > $(( CHARS_VULN / 1024 ))KB) — redirecionando para chunk"
+        cmd_chunk "$file" "Extract all security-relevant patterns: eval/exec calls, SQL concatenation, unsanitized input, hardcoded keys/tokens, open permissions, missing auth checks, unsafe deserialization, command injection, path traversal. Context: ${context}"
+        return $?
+    fi
 
     # Contexto expandido para vuln research
     local content
@@ -587,20 +621,14 @@ cmd_search_vuln() {
     _timer_start
     local result
     result=$(ollama_query \
-        "You are a software security engineer performing a code review. Analyze the provided source code, configuration, or log file for potential security weaknesses. For each finding provide:
+        "${EXTRACT_RULE} Extract all security-relevant patterns from the code. For each finding output:
+- **Pattern**: the exact code snippet (quote it)
+- **Location**: line number or function name
+- **Category**: input_validation | access_control | crypto | config | info_exposure | error_handling | race_condition | hardcoded_creds | injection | other
 
-**Format per finding:**
-- **ID**: FINDING-N
-- **Severity**: CRITICAL / HIGH / MEDIUM / LOW / INFO
-- **Category**: (e.g., input validation, access control, cryptography, config, information exposure)
-- **Location**: line number or section
-- **Description**: technical description of the weakness
-- **Impact**: potential consequences if exploited
-- **Recommendation**: how to remediate
+Patterns to extract: eval/exec calls, SQL concatenation, unsanitized user input, hardcoded passwords/keys/tokens, open permissions, missing auth checks, unsafe deserialization, command injection vectors, path traversal, TOCTOU patterns.
 
-Focus on: input validation gaps, access control issues, cryptographic weaknesses, configuration problems, information exposure, error handling, race conditions, and hardcoded credentials.
-
-End with a findings summary by severity." \
+Do NOT assess severity or recommend fixes — just extract the raw patterns and their locations." \
         "Security code review of: $(basename "$file")
 Context: ${context}
 File type: $(file -b "$file" 2>/dev/null || echo unknown)
@@ -609,7 +637,7 @@ File type: $(file -b "$file" 2>/dev/null || echo unknown)
 ${content}
 --- END ---" \
         "$PREDICT_VULN" \
-        "$TEMP_ANALYTICAL")
+        "$TEMP_DETERMINISTIC")
     echo "$result"
     [[ -n "$result" ]] && cache_put "$ckey" "$result"
     _timer_end
@@ -628,17 +656,17 @@ cmd_bulk() {
     done
 
     local dir="${1:-}"
-    [[ -z "$dir" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit 1; }
+    [[ -z "$dir" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit $EX_USAGE; }
     shift
     local instruction="$*"
-    [[ -z "$instruction" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit 1; }
+    [[ -z "$instruction" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit $EX_USAGE; }
 
     require_dir "$dir"
     ensure_ollama
 
     _timer_start
 
-    echo "## Bulk Analysis: $(basename "$dir")"
+    echo "## Bulk Processing: $(basename "$dir")"
     echo "**Instruction**: ${instruction}"
     echo ""
 
@@ -693,18 +721,21 @@ cmd_bulk() {
 
             log_info "[${idx}/${total}] Dispatching: ${relpath}"
 
-            # Lança em background
+            # Lança em background (stderr redireciona pra log de erro)
             (
-                local r
+                local r err_file="${tmpdir}/err_$(printf '%04d' $idx).log"
                 r=$(ollama_query \
-                    "You process files according to instructions. Be concise and structured." \
+                    "${EXTRACT_RULE} Process the file according to the instruction. Output structured data only." \
                     "Instruction: ${instruction}
 
 --- FILE: ${relpath} ($(file_size_human "$f")) ---
 ${content}
 --- END ---" \
                     "$PREDICT_BULK" \
-                    "$TEMP_BALANCED" 2>/dev/null)
+                    "$TEMP_BALANCED" 2>"$err_file")
+                if [[ -z "$r" ]]; then
+                    r="⚠️ GPU processing failed for this file"
+                fi
                 {
                     echo "### ${relpath}"
                     echo ""
@@ -746,7 +777,7 @@ ${content}
             content=$(smart_extract "$f" "$CHARS_BULK")
 
             ollama_query \
-                "You process files according to instructions. Be concise and structured." \
+                "${EXTRACT_RULE} Process the file according to the instruction. Output structured data only." \
                 "Instruction: ${instruction}
 
 --- FILE: ${relpath} ($(file_size_human "$f")) ---
@@ -770,12 +801,13 @@ ${content}
 cmd_chunk() {
     # Auto-chunk: fatia arquivo grande, processa cada chunk na GPU em paralelo, agrega
     local file="${1:-}"
-    [[ -z "$file" ]] && { log_err "Uso: gpu chunk <arquivo> \"instrução\" [chunk_lines]"; exit 1; }
+    [[ -z "$file" ]] && { log_err "Uso: gpu chunk <arquivo> \"instrução\" [chunk_lines] [overlap_lines]"; exit $EX_USAGE; }
     shift
-    local instruction="${1:-analyze this code for bugs, security issues, and code smells}"
+    local instruction="${1:-extract bugs, security issues, and code smells}"
     shift 2>/dev/null || true
     local chunk_lines="${1:-800}"
-    local overlap_lines=50
+    shift 2>/dev/null || true
+    local overlap_lines="${1:-50}"
 
     require_file "$file"
     ensure_ollama
@@ -835,7 +867,7 @@ cmd_chunk() {
     local num_chunks=$chunk_num
     log_info "Split into ${num_chunks} chunks, processing with 2 parallel workers..."
 
-    echo "## Chunk Analysis: $(basename "$file")"
+    echo "## Chunk Processing: $(basename "$file")"
     echo "**File**: ${size}, ${total_lines} lines"
     echo "**Chunks**: ${num_chunks} (${chunk_lines}L each, ${overlap_lines}L overlap)"
     echo "**Instruction**: ${instruction}"
@@ -850,18 +882,21 @@ cmd_chunk() {
         log_info "[${i}/${num_chunks}] Dispatching chunk"
 
         (
-            local content
+            local content err_file="${tmpdir}/err_$(printf '%03d' $i).log"
             content=$(cat "$chunk_file")
             local r
             r=$(ollama_query \
-                "You are analyzing a CHUNK of a larger file. The chunk header tells you the exact line range. Be precise with line numbers relative to the ORIGINAL file. If a finding spans a chunk boundary, note it. Format findings as a structured list." \
+                "${EXTRACT_RULE} You are processing a CHUNK of a larger file. The chunk header shows the line range. Extract items matching the instruction from THIS chunk only. Quote exact content. Use line numbers from the header. Output as a structured list." \
                 "Instruction: ${instruction}
 
 --- CHUNK CONTENT ---
 ${content}
 --- END CHUNK ---" \
                 "$PREDICT_MEDIUM" \
-                "$TEMP_ANALYTICAL" 2>/dev/null)
+                "$TEMP_DETERMINISTIC" 2>"$err_file")
+            if [[ -z "$r" ]]; then
+                r="⚠️ GPU processing failed for this chunk"
+            fi
             echo "$r" > "$result_file"
         ) &
 
@@ -897,14 +932,14 @@ ${content}
     echo ""
     echo "**Summary**: ${num_chunks} chunks processed from ${total_lines} lines"
     echo "**Note**: Opus should now cross-reference and deduplicate findings across chunks"
-    log_ok "Chunk analysis complete: ${num_chunks} chunks"
+    log_ok "Chunk processing complete: ${num_chunks} chunks"
     _timer_end
 }
 
 cmd_diff() {
     local file1="${1:-}"
     local file2="${2:-}"
-    [[ -z "$file1" || -z "$file2" ]] && { log_err "Uso: gpu diff <file1> <file2> [\"foco\"]"; exit 1; }
+    [[ -z "$file1" || -z "$file2" ]] && { log_err "Uso: gpu diff <file1> <file2> [\"foco\"]"; exit $EX_USAGE; }
     shift 2
     local focus="${*:-general comparison}"
 
@@ -928,7 +963,7 @@ cmd_diff() {
     _timer_start
     local result
     result=$(ollama_query \
-        "You compare two files and highlight meaningful differences. Focus on: structural changes, added/removed functionality, security implications, and potential issues. Be concise." \
+        "${EXTRACT_RULE} Extract the structural differences between these two files. For each difference output: what changed (added/removed/modified), the exact content from each file, and the location. Do not judge whether changes are good or bad." \
         "Compare these files. Focus: ${focus}
 
 --- FILE 1: $(basename "$file1") ($(file_size_human "$file1")) ---
@@ -939,7 +974,7 @@ ${content1}
 ${content2}
 --- END FILE 2 ---" \
         "$PREDICT_LARGE" \
-        "$TEMP_ANALYTICAL")
+        "$TEMP_DETERMINISTIC")
     echo "$result"
     [[ -n "$result" ]] && cache_put "$ckey" "$result"
     _timer_end
@@ -950,20 +985,20 @@ cmd_pipe() {
     # Uso: gpu scan file "bugs" | gpu pipe "priorize por severidade" | gpu pipe "sugira fixes"
     # Uso: cat findings.txt | gpu pipe "classifique cada finding"
     local instruction="$*"
-    [[ -z "$instruction" ]] && { log_err "Uso: echo 'data' | gpu pipe \"instrução\""; exit 1; }
+    [[ -z "$instruction" ]] && { log_err "Uso: echo 'data' | gpu pipe \"instrução\""; exit $EX_USAGE; }
 
     # Lê stdin (output do comando anterior)
     local stdin_data
     if [[ -t 0 ]]; then
         log_err "gpu pipe espera input via stdin (pipe)"
         log_err "Exemplo: gpu scan file.js \"bugs\" | gpu pipe \"priorize\""
-        exit 1
+        exit $EX_USAGE
     fi
     stdin_data=$(cat)
 
     if [[ -z "$stdin_data" ]]; then
         log_err "stdin vazio — nada para processar"
-        exit 1
+        exit $EX_USAGE
     fi
 
     local input_size=${#stdin_data}
@@ -979,15 +1014,49 @@ cmd_pipe() {
 
     _timer_start
     ollama_query \
-        "You are part of a processing pipeline. Your input is the output from a previous analysis step. Process it according to the instruction and output a clean, structured result that can be consumed by the next step or by a human." \
+        "${EXTRACT_RULE} You are a data transformation step in a pipeline. Apply the instruction to transform the input data. Output clean, structured data ready for the next step. Do not add commentary — only output the transformed result." \
         "Instruction: ${instruction}
 
 --- INPUT FROM PREVIOUS STEP ---
 ${stdin_data}
 --- END INPUT ---" \
         "$PREDICT_LARGE" \
-        "$TEMP_ANALYTICAL"
+        "$TEMP_DETERMINISTIC"
     _timer_end
+}
+
+cmd_cache_clean() {
+    local cleaned=0
+    local kept=0
+    local now
+    now=$(date +%s)
+
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        log_info "Cache dir não existe: $CACHE_DIR"
+        return 0
+    fi
+
+    local total
+    total=$(find "$CACHE_DIR" -name '*.txt' 2>/dev/null | wc -l)
+
+    while IFS= read -r -d '' cache_file; do
+        local age=$(( now - $(stat -c%Y "$cache_file") ))
+        if (( age > 86400 )); then
+            rm -f "$cache_file"
+            ((cleaned++))
+        else
+            ((kept++))
+        fi
+    done < <(find "$CACHE_DIR" -name '*.txt' -print0 2>/dev/null)
+
+    local freed_size
+    if (( cleaned > 0 )); then
+        freed_size="(cache dir: $(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1))"
+    else
+        freed_size=""
+    fi
+
+    log_ok "Cache cleanup: ${cleaned} expired removed, ${kept} valid kept ${freed_size}"
 }
 
 cmd_stats() {
@@ -1051,7 +1120,7 @@ cmd_stats() {
     echo "  - Version: ${VERSION}"
     echo "  - Timeout: ${CURL_TIMEOUT}s"
     echo "  - Content limits: small=${CHARS_SMALL} med=${CHARS_MEDIUM} large=${CHARS_LARGE} vuln=${CHARS_VULN} diff=${CHARS_DIFF}"
-    echo "  - Temperatures: deterministic=${TEMP_DETERMINISTIC} analytical=${TEMP_ANALYTICAL} balanced=${TEMP_BALANCED} creative=${TEMP_CREATIVE}"
+    echo "  - Temperatures: extract=${TEMP_DETERMINISTIC} condense=${TEMP_BALANCED} creative=${TEMP_CREATIVE}"
     echo "  - Retry: ${MAX_RETRIES}x"
     echo "  - OLLAMA_MODELS: ${OLLAMA_MODELS}"
     echo ""
@@ -1081,6 +1150,14 @@ cmd_stats() {
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 
+# Parse global flags
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --no-cache) NO_CACHE=true; shift ;;
+        *) break ;;
+    esac
+done
+
 CMD="${1:-}"
 shift 2>/dev/null || true
 
@@ -1095,12 +1172,13 @@ case "$CMD" in
     chunk)        cmd_chunk "$@" ;;
     pipe)         cmd_pipe "$@" ;;
     diff)         cmd_diff "$@" ;;
+    cache-clean)  cmd_cache_clean ;;
     stats)        cmd_stats ;;
     -v|--version) echo "gpu v${VERSION}" ;;
     -h|--help|help|"")
         echo -e "${C_BOLD}gpu v${VERSION}${C_RESET} — Bridge Híbrida Opus↔RTX4090"
         echo ""
-        echo -e "${C_CYAN}Arquitetura:${C_RESET}  Opus organiza → GPU processa → Opus raciocina"
+        echo -e "${C_CYAN}Arquitetura:${C_RESET}  Opus decide → GPU extrai (180 tok/s) → Opus analisa"
         echo -e "${C_CYAN}Modelo:${C_RESET}       Qwen3-Coder-30B-MoE abliterated (178 tok/s, zero censura)"
         echo ""
         echo -e "${C_CYAN}Comandos:${C_RESET}"
@@ -1111,9 +1189,10 @@ case "$CMD" in
         echo "  gpu triage <bugreport.zip|log>       Pipeline completo Android"
         echo "  gpu search-vuln <file> \"contexto\"    Auditoria de segurança"
         echo "  gpu bulk [-r] [-p] <dir> \"instrução\" Processa pasta (-p = paralelo)"
-        echo "  gpu chunk <file> \"instrução\" [lines] Auto-fatia + paralelo + agrega"
+        echo "  gpu chunk <file> \"instrução\" [lines] [overlap] Auto-fatia + paralelo + agrega"
         echo "  gpu pipe \"instrução\"                 Pipeline: stdin → GPU → stdout"
         echo "  gpu diff <f1> <f2> \"foco\"            Compara dois arquivos"
+        echo "  gpu cache-clean                      Remove cache expirado (>24h)"
         echo "  gpu stats                            Status do sistema"
         echo ""
         echo -e "${C_CYAN}Exemplos:${C_RESET}"
@@ -1121,10 +1200,23 @@ case "$CMD" in
         echo "  gpu scan crash.log \"null pointer\""
         echo "  gpu summarize /var/log/syslog"
         echo "  gpu search-vuln app.py \"REST API\""
-        echo "  gpu bulk -r -p src/ \"find TODO comments\""
-        echo "  gpu chunk bigfile.js \"find bugs\" 800"
+        echo "  gpu bulk -r -p src/ \"extract TODO comments\""
+        echo "  gpu chunk bigfile.js \"extract bugs\" 800"
+        echo "  gpu chunk bigfile.js \"extract bugs\" 800 100  # 800L chunks, 100L overlap"
         echo "  gpu scan file.js \"bugs\" | gpu pipe \"priorize por severidade\""
         echo "  gpu diff old.conf new.conf \"security changes\""
+        echo ""
+        echo ""
+        echo -e "${C_CYAN}Flags globais:${C_RESET}"
+        echo "  gpu --no-cache <cmd> ...     Ignora cache, força reprocessamento"
+        echo ""
+        echo -e "${C_CYAN}Exit codes:${C_RESET}"
+        echo "  0  Sucesso"
+        echo "  1  Erro genérico"
+        echo "  2  Arquivo não encontrado / binário / sem permissão"
+        echo "  3  Ollama offline / modelo indisponível"
+        echo "  4  Timeout na query"
+        echo "  5  Argumento faltando / uso incorreto"
         echo ""
         echo -e "${C_CYAN}Env:${C_RESET}"
         echo "  GPU_MODEL=modelo             Override modelo (default: qwen3-coder:30b)"
@@ -1134,6 +1226,6 @@ case "$CMD" in
     *)
         log_err "Comando desconhecido: $CMD"
         echo "Use: gpu --help" >&2
-        exit 1
+        exit $EX_USAGE
         ;;
 esac

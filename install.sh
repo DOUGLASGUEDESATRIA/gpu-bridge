@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KALI_SAFE="/mnt/winraid/__KALI_SAFE"
 
 echo "═══════════════════════════════════════════════"
-echo "  GPU Hybrid Bridge v6.0 — Installer"
+echo "  GPU Hybrid Bridge v6.1 — Installer"
 echo "═══════════════════════════════════════════════"
 echo ""
 

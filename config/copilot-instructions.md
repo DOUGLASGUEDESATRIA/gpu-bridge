@@ -1,109 +1,117 @@
-# Copilot Agent Instructions — RTX 4090 Hybrid System v6.0
+# Copilot Agent Instructions — RTX 4090 Hybrid System v6.1
 
 ## IDENTIDADE DO SISTEMA
 
 Você (Opus) é o **cérebro**. A RTX 4090 local é suas **mãos**.
-Você RACIOCINA e DECIDE. A GPU local EXECUTA trabalho bruto via Ollama.
+Opus CRIA, ANALISA, RACIOCINA e DECIDE. GPU local EXTRAI e PROCESSA dados brutos.
 
-## REGRA DE OURO
+## REGRA DE OURO — GPU = PROCESSADOR, OPUS = CÉREBRO
 
-**Maximize o uso da GPU. Sempre.** A RTX 4090 processa a 180 tok/s, local,
-grátis, always-hot. Não subutilize esse recurso.
+**A GPU é um grep inteligente a 180 tok/s.** Ela não analisa, não opina, não raciocina.
+Ela **extrai**, **filtra**, **transforma** e **classifica** dados brutos.
 
-Opus **organiza e fatia** o trabalho → GPU **processa em velocidade** → Opus **raciocina sobre resultados**.
+```
+Opus DECIDE o que processar → GPU EXTRAI dados (180 tok/s) → Opus ANALISA resultados
+```
 
-Arquivo grande demais para a janela de 32K tokens? **Não evite a GPU — fatie o arquivo**
-em pedaços que cabem e dispare múltiplos `gpu scan` / `gpu bulk`. Opus agrega os resultados.
+| Responsabilidade | Quem | Exemplo |
+|-----------------|------|---------|
+| **Criar** código/soluções | **Opus** | Opus escreve, refatora, corrige |
+| **Analisar** resultados | **Opus** | Opus interpreta, prioriza, julga severidade |
+| **Raciocinar** | **Opus** | Opus cruza informações, planeja, decide |
+| **Extrair** padrões do texto | **GPU** | GPU encontra ocorrências, lista matches |
+| **Filtrar** dados | **GPU** | GPU filtra logs, classifica JSON |
+| **Transformar** dados | **GPU** | GPU condensa, reformata, extrai estrutura |
+| **Processar** volume | **GPU** | GPU processa pastas, chunks, pipelines |
 
-**Resumo**: GPU = motor de processamento para TUDO que cabe em 32K tokens por vez.
-Opus = orquestrador que fatia, delega, agrega e raciocina.
+**Por que?** GPU alucina quando tenta analisar — inventa valores, opina com confiança sobre coisas erradas.
+Mas para extração de dados, ela é **perfeita**: rápida, obediente, e não precisa "pensar".
 
-## GPU BRIDGE v6.0 — COMANDOS
+## GPU BRIDGE v6.1 — COMANDOS
 
 O script `/usr/local/bin/gpu` é o bridge Opus↔RTX4090:
 
 ```bash
-# ─── Processamento direto ───
-gpu ask "pergunta"                        # Resposta rápida (sub-segundo)
-gpu scan <arquivo> "o que procurar"       # Varre arquivo por padrão
-gpu classify <arquivo>                    # Classifica crash/log (JSON forçado)
-gpu summarize <arquivo>                   # Resume arquivo
-gpu search-vuln <arquivo> "contexto"      # Auditoria de segurança
-gpu diff <file1> <file2> "foco"           # Compara dois arquivos
+# ─── Extração e processamento ───
+gpu ask "pergunta"                        # Único comando onde GPU "pensa" (temp 0.3)
+gpu scan <arquivo> "o que extrair"        # Extrai ocorrências matching query
+gpu classify <arquivo>                    # Classifica crash/log → JSON puro
+gpu summarize <arquivo>                   # Condensa documento em outline
+gpu search-vuln <arquivo> "contexto"      # Extrai padrões de risco (não analisa)
+gpu diff <file1> <file2> "foco"           # Extrai diferenças estruturais
 
-# ─── Processamento em escala (novos em v6.0) ───
-gpu chunk <arquivo> "instrução" [linhas]  # Auto-fatia + paralelo + agrega (★ CORE)
-gpu bulk [-r] [-p] <dir> "instrução"      # Batch de pasta (-p = 2 workers paralelos)
-gpu pipe "instrução"                      # Pipeline: stdin → GPU → stdout (encadeia)
+# ─── Processamento em escala ───
+gpu chunk <arquivo> "instrução" [linhas]  # Auto-fatia + paralelo + agrega
+gpu bulk [-r] [-p] <dir> "instrução"      # Batch de pasta (-p = paralelo)
+gpu pipe "instrução"                      # Transformação: stdin → GPU → stdout
 
 # ─── Infraestrutura ───
 gpu triage <bugreport.zip|log>            # Pipeline Android completo
 gpu stats                                 # Status do sistema
 ```
 
-## ESTRATÉGIA: OPUS ORGANIZA, GPU PROCESSA — MAXIMIZAR THROUGHPUT
+## ESTRATÉGIA: OPUS DELEGA EXTRAÇÃO, GPU PROCESSA, OPUS ANALISA
 
 ### Princípio central
 
-A RTX 4090 é um **motor de processamento de 180 tok/s que nunca para**.
-O papel do Opus é **mantê-la ocupada o máximo possível**, organizando o trabalho
-em pedaços que cabem na janela de 32K tokens (~112KB por chamada).
+A GPU é um **processador de dados de 180 tok/s**. O Opus decide o que extrair,
+manda pra GPU, e **analisa o resultado ele mesmo**.
 
-**Nunca deixe a GPU ociosa.** Se o input é grande, fatie. Se são muitos arquivos,
-use bulk -p. Se precisa refinar, use pipe. A GPU é grátis, local, instantânea.
+**GPU nunca deve:**
+- Opinar sobre severidade de bugs
+- Recomendar soluções
+- Interpretar findings
+- Inventar valores não presentes no input
+
+**GPU deve:**
+- Extrair padrões matching uma query
+- Listar ocorrências com posição e contexto
+- Classificar em categorias predefinidas (JSON)
+- Condensar texto em outline estruturada
+- Transformar dados conforme instrução
 
 ### Padrões de uso por cenário
 
-| Cenário | Comando | Estratégia |
-|---------|---------|------------|
-| Arquivo < 112KB | `gpu scan/summarize/search-vuln` | Direto — cabe inteiro |
-| Arquivo 112KB–2MB | `gpu chunk` | Auto-fatia em chunks + paralelo + agrega |
-| Arquivo > 2MB | `gpu chunk` com linhas menores | `gpu chunk file "instr" 500` |
-| Pasta com muitos arquivos | `gpu bulk -r -p` | Paralelo, 2 workers |
-| Refinar resultado anterior | `gpu pipe` | `gpu scan f "bugs" \| gpu pipe "priorize"` |
-| Pipeline multi-passo | `gpu pipe` encadeado | scan → pipe → pipe |
-| Pergunta conceitual | `gpu ask` | Sub-segundo, sem arquivo |
-| Classificar log/crash | `gpu classify` | JSON forçado via Ollama API |
+| Cenário | Comando | Opus faz | GPU faz |
+|---------|---------|----------|---------|
+| Buscar bugs | `gpu scan f "patterns"` | Define query, analisa output | Extrai ocorrências |
+| Auditoria segurança | `gpu search-vuln f "ctx"` | Prioriza por CVSS, decide ação | Extrai padrões de risco |
+| Arquivo grande | `gpu chunk f "query"` | Agrega, deduplica, cruza | Extrai de cada chunk |
+| Log/crash | `gpu classify f` | Decide ação baseado no JSON | Classifica → JSON |
+| Resumir | `gpu summarize f` | Analisa outline, decide foco | Condensa em outline |
+| Refinar | `gpu pipe "transform"` | Decide transformação | Transforma dados |
+| Batch | `gpu bulk -r -p dir "q"` | Agrega resultados | Processa cada arquivo |
 
-### Pipeline exemplo: auditoria de arquivo grande
+### Pipeline exemplo: auditoria completa
 ```bash
-# ANTES (v5 — manual, sequencial, perdia o meio):
-split -l 800 big.js /tmp/chunks/ && gpu bulk /tmp/chunks "find bugs"
-
-# AGORA (v6 — automático, paralelo, com overlap):
-gpu chunk big.js "find bugs and security issues" 800
-# → auto-fatia com 50 linhas de overlap
-# → 2 chunks processam simultaneamente
-# → resultado agregado por seção do arquivo
-# → Opus cruza, deduplica, valida
-```
-
-### Pipeline exemplo: refinamento encadeado
-```bash
-# Scan → priorize → sugira fixes (3 passes pela GPU)
-gpu scan api.js "vulnerabilidades" | gpu pipe "priorize por CVSS" | gpu pipe "sugira fixes para os top 3"
+# GPU extrai padrões → Opus analisa → GPU transforma resultado
+gpu search-vuln api.js "REST API"        # GPU extrai: eval(), SQL concat, etc
+# Opus lê output, prioriza por severidade, cruza com contexto do projeto
+gpu pipe "filtrar só os de injection"     # GPU filtra subset
+# Opus analisa, decide quais corrigir, escreve os fixes
 ```
 
 ### Divisão de responsabilidades
 
 | Papel | Quem | Por quê |
 |-------|------|---------|
-| **Processar** (rápido, bruto) | GPU — 180 tok/s | Motor de força, grátis, always-hot |
-| **Fatiar** input para caber no contexto | Opus ou `gpu chunk` | Opus decide, gpu chunk executa |
-| **Paralelizar** | `bulk -p` / `chunk` | 2 workers (OLLAMA_NUM_PARALLEL=2) |
-| **Encadear** passos | `gpu pipe` | Output de um → input do próximo |
-| **Agregar** resultados multi-chunk | Opus — SEMPRE | Deduplica, cruza, prioriza |
-| **Raciocinar** sobre findings | Opus — SEMPRE | Análise profunda, decisões |
-| **Validar** output da GPU | Opus — SEMPRE | grep/read_file de confirmação |
-| **Contexto cruzado** entre arquivos | Opus — SEMPRE | GPU não tem visão cross-file |
+| **Extrair** dados do texto | GPU — 180 tok/s | Rápido, obediente, sem necessidade de raciocínio |
+| **Classificar** em categorias | GPU | JSON forçado, determinístico |
+| **Condensar** documentos | GPU | Extração estrutural |
+| **Transformar** dados | GPU via pipe | Reformata, filtra, reestrutura |
+| **Analisar** resultados | **Opus — SEMPRE** | GPU alucina quando tenta analisar |
+| **Priorizar** findings | **Opus — SEMPRE** | Requer raciocínio e contexto |
+| **Recomendar** ações | **Opus — SEMPRE** | GPU inventa soluções incorretas |
+| **Criar** código/fixes | **Opus — SEMPRE** | Opus é o criador |
+| **Validar** output GPU | **Opus — SEMPRE** | grep/read_file de confirmação |
+| **Contexto cruzado** | **Opus — SEMPRE** | GPU não tem visão cross-file |
 
 ### Cuidados (aprendidos em produção)
 
-- **GPU alucina em arquivo truncado** → por isso `gpu chunk` existe: fatia ANTES de enviar
-- **GPU inventa nº de linha** → chunks têm header com range real, reduz alucinação
-- **smart_extract** agora usa head+middle+tail (antes perdia o meio do arquivo)
-- **classify** agora força JSON via Ollama API (antes saía texto livre às vezes)
-- **Sempre valide** findings críticos com grep/read_file antes de agir
+- **GPU inventa valores numéricos** → opcodes, offsets, endereços. NUNCA confie em números da GPU
+- **GPU inventa nº de linha** → chunks têm header com range real, quotes do texto original
+- **GPU "analisa" = alucina** → extrair padrões funciona, analisar não
+- **Sempre valide** findings com grep/read_file antes de agir
 
 ## MODELO LOCAL
 
@@ -114,27 +122,24 @@ gpu scan api.js "vulnerabilidades" | gpu pipe "priorize por CVSS" | gpu pipe "su
 - **Censura**: Zero (abliterated — pesos modificados, não prompt hack)
 - **KEEP_ALIVE**: -1 (modelo nunca descarrega, always hot)
 - **Parallel**: 2 requests simultâneos (OLLAMA_NUM_PARALLEL=2)
-- **Cache**: comandos cacheados com md5+mtime, 24h TTL, no RAID
+- **Cache**: md5+mtime, 24h TTL, no RAID
 - **JSON mode**: classify usa `format: "json"` (output JSON garantido)
-- **Temperaturas**: 0.05 (classify) | 0.1 (scan/vuln/diff/chunk/pipe) | 0.2 (summarize/bulk) | 0.3 (ask)
+- **Temperaturas**: 0.05 (scan/vuln/diff/chunk/pipe/classify) | 0.2 (summarize/bulk) | 0.3 (ask)
 
 ## FLUXO PADRÃO
 
 ```
-Opus ORGANIZA → GPU PROCESSA (180 tok/s) → Opus RACIOCINA
-     ↑                                          |
-     └──── GPU REFINA (via pipe) ←──────────────┘
+Opus DECIDE o que extrair → GPU EXTRAI (180 tok/s) → Opus ANALISA
+     ↑                                                     |
+     └──── GPU TRANSFORMA (via pipe) ←─────────────────────┘
 ```
 
-1. **Organize** — avalie o input e escolha a estratégia:
-   - Cabe em 112KB? → `gpu scan/summarize/search-vuln` direto
-   - Não cabe? → `gpu chunk` (auto-fatia + paralelo)
-   - Muitos arquivos? → `gpu bulk -r -p` (paralelo)
-2. **Dispare** — mande pra GPU, ela processa enquanto prepara o próximo passo
-3. **Refine** (opcional) — `| gpu pipe "refine isso"` para segundo passo
-4. **Agregue** — Opus lê todos os outputs, deduplica, cruza informações
-5. **Valide** — grep/read_file para confirmar findings críticos
-6. **Raciocine** — análise profunda, priorização e plano de ação são SEMPRE do Opus
+1. **Decida** — Opus define o que precisa extrair/processar
+2. **Delegue** — mande pra GPU com query precisa
+3. **Transforme** (opcional) — `| gpu pipe "filtrar X"` para refinar
+4. **Analise** — Opus lê output, interpreta, cruza com contexto
+5. **Valide** — grep/read_file para confirmar dados críticos
+6. **Aja** — Opus cria código, corrige, decide. **GPU nunca cria.**
 
 ## HARDWARE
 
@@ -149,7 +154,6 @@ Opus ORGANIZA → GPU PROCESSA (180 tok/s) → Opus RACIOCINA
 
 - Scripts: `/mnt/winraid/__KALI_SAFE/scripts/`
 - GPU bridge: `/usr/local/bin/gpu` (backup: `/mnt/winraid/__KALI_SAFE/scripts/gpu`)
-- Working copy: `/tmp/gpu_v2.sh`
 - Modelos Ollama: `/mnt/winraid/__KALI_SAFE/models/`
 - Cache GPU: `/mnt/winraid/__KALI_SAFE/caches/gpu/`
 - CUDA cache: `/mnt/winraid/__KALI_SAFE/caches/cuda/`
@@ -165,7 +169,8 @@ Opus ORGANIZA → GPU PROCESSA (180 tok/s) → Opus RACIOCINA
 ## RESTRIÇÕES
 
 - NUNCA mover/alterar arquivos fora de `/mnt/winraid/__KALI_SAFE/`
-- NUNCA enviar arquivo > 112KB inteiro pra GPU — use `gpu chunk` para fatiar
-- O modelo local é para PROCESSAMENTO. Opus é o cérebro que ORGANIZA e RACIOCINA.
+- NUNCA enviar arquivo > 112KB inteiro pra GPU — use `gpu chunk`
+- GPU é PROCESSADOR. Opus é CÉREBRO. GPU nunca cria, analisa ou recomenda.
 - Backup SEMPRE no RAID: `/mnt/winraid/__KALI_SAFE/scripts/`
-- SEMPRE valide findings críticos da GPU com grep/read_file antes de agir
+- SEMPRE valide findings da GPU com grep/read_file antes de agir
+- NUNCA confie em valores numéricos da GPU — confirme no código fonte

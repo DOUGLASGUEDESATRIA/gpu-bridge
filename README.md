@@ -1,6 +1,6 @@
-# GPU Hybrid Bridge v6.0
+# GPU Hybrid Bridge v6.1
 
-**Sistema híbrido Opus↔RTX 4090** — Opus orquestra e fatia, GPU processa a 180 tok/s.
+**Sistema híbrido Opus↔RTX 4090** — Opus decide e analisa, GPU extrai e processa a 180 tok/s.
 
 ## Arquitetura
 
@@ -8,7 +8,7 @@
 ┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
 │  Copilot     │────▶│  gpu CLI    │────▶│  Ollama + RTX    │
 │  (Opus)      │◀────│  bridge     │◀────│  4090 (24GB)     │
-│  = orquestra │     │  = terminal │     │  = processamento │
+│  = cérebro   │     │  = terminal │     │  = processador   │
 └─────────────┘     └─────────────┘     └──────────────────┘
         │                                        ▲
         │     ┌──────────────────────────┐       │
@@ -17,8 +17,8 @@
               └──────────────────────────┘
 ```
 
-Opus organiza → GPU processa (180 tok/s) → Opus raciocina.
-Qualquer arquivo, qualquer tamanho — Opus fatia, GPU processa em paralelo.
+Opus decide → GPU extrai (180 tok/s) → Opus analisa.
+GPU = grep inteligente. Nunca analisa, nunca opina. Extrai, filtra, transforma.
 
 ## Hardware
 
@@ -57,13 +57,14 @@ gpu pipe "instrução"                  # stdin→GPU→stdout (chainable)
 gpu stats                             # Status do sistema
 ```
 
-### Novos em v6.0
+### Novos em v6.0/v6.1
 
-| Comando | Descrição |
-|---------|-----------|
+| Comando/Feature | Descrição |
+|----------------|-----------|
 | `gpu chunk` | Auto-fatia arquivos grandes com overlap, processa chunks em paralelo, agrega resultados |
-| `gpu pipe` | stdin→GPU→stdout — permite encadear: `gpu scan f \| gpu pipe "resumir"` |
+| `gpu pipe` | stdin→GPU→stdout — permite encadear: `gpu scan f \| gpu pipe "filtrar"` |
 | `gpu bulk -p` | Modo paralelo: 2 workers simultâneos via `OLLAMA_NUM_PARALLEL=2` |
+| `EXTRACT_RULE` | GPU = processador puro. Todos os prompts reescritos para extração, não análise |
 
 ## Instalação
 
@@ -111,7 +112,7 @@ cp config/copilot-instructions.md /mnt/winraid/__KALI_SAFE/copilot-instructions.
 gpu-hybrid-bridge/
 ├── README.md                          # Este arquivo
 ├── scripts/
-│   └── gpu                            # Bridge script v6.0 (1140 linhas)
+│   └── gpu                            # Bridge script v6.1 (~1140 linhas)
 ├── config/
 │   ├── copilot-instructions.md        # Instruções globais pro Copilot
 │   ├── ollama-override.conf           # Systemd override (performance)
@@ -138,9 +139,8 @@ gpu-hybrid-bridge/
 
 | Tipo | Temp | Comandos |
 |------|------|----------|
-| Deterministic | 0.05 | classify |
-| Analytical | 0.10 | scan, search-vuln, diff, chunk, pipe |
-| Balanced | 0.20 | summarize, bulk |
+| Extract | 0.05 | scan, search-vuln, diff, chunk, pipe, classify |
+| Condense | 0.20 | summarize, bulk |
 | Creative | 0.30 | ask |
 
 ## Histórico
@@ -154,6 +154,7 @@ gpu-hybrid-bridge/
 | v5.0 | — | 32K ctx, KEEP_ALIVE=-1, retry, temperatures, cache expansion |
 | v5.1 | Feb 2026 | Cache guard, validate_model integrado, binary rejection, dynamic stats |
 | v6.0 | Feb 2026 | Auto-chunk, pipe, bulk paralelo, smart_extract head+mid+tail, classify JSON |
+| v6.1 | Feb 2026 | GPU = processador puro (EXTRACT_RULE), temperaturas 4→3 tiers, prompts reescritos |
 
 ## Sessão Já Iniciada
 

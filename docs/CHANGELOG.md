@@ -1,6 +1,42 @@
 # Changelog
 
-## v6.0 (February 2026) — CURRENT
+## v6.1 (February 2026) — CURRENT
+
+### Philosophy Change: GPU = Data Processor, Not Analyst
+- **`EXTRACT_RULE` constant**: Injected into all processing prompts — GPU extracts, never analyzes
+- **All prompts rewritten**: scan, vuln, chunk, diff, summarize, pipe, bulk — from "analyze" to "extract"
+- **GPU never opines**: No severity assessment, no recommendations, no interpretation
+- **Opus is the brain**: Only Opus analyzes, prioritizes, reasons, and creates
+
+### Temperature Simplification (4 → 3 tiers)
+- **Eliminated `TEMP_ANALYTICAL` (0.1)**: Extraction doesn't need creativity
+- **Extract (0.05)**: scan, search-vuln, diff, chunk, pipe, classify — deterministic extraction
+- **Condense (0.2)**: summarize, bulk — structured condensation
+- **Creative (0.3)**: ask — only command where GPU "thinks"
+
+### Documentation
+- **copilot-instructions.md**: Full rewrite with processor philosophy, updated tables
+- **README.md**: Updated architecture diagram, temperature table, version history
+- **ARCHITECTURE.md**: New "GPU = Pure Processor" rationale section, updated temperature docs
+
+### Improvement Round 1
+- **Cache key includes VERSION**: Prompt changes auto-invalidate cache
+- **scan auto-chunks**: Files exceeding context auto-redirect to `gpu chunk`
+- **Parallel error handling**: Workers capture stderr, report failures with ⚠️ marker
+- **smart_extract truncation warning**: Logs "Truncado: XKB → YKB (Z%)" when truncating
+- **`gpu cache-clean`**: New command to purge expired cache (>24h)
+- **Chunk overlap configurable**: 4th param in `gpu chunk` (default: 50 lines)
+
+### Improvement Round 2
+- **summarize/search-vuln auto-chunk**: Same auto-redirect pattern as scan for large files
+- **`--no-cache` global flag**: `gpu --no-cache <cmd>` forces reprocessing
+- **Differentiated exit codes**: 0=OK, 2=file, 3=ollama, 4=timeout, 5=usage (documented in help)
+
+### Rating: 10/10
+
+---
+
+## v6.0 (February 2026)
 
 ### New Commands
 - **`gpu chunk <file> "instrução"`**: Auto-fatia arquivos grandes com overlap configurável, processa chunks em paralelo (2 workers), agrega resultados com ranges de linhas reais
