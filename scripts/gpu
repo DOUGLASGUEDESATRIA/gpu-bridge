@@ -1,0 +1,839 @@
+#!/usr/bin/env bash
+# ============================================================================
+# gpu v5.0 — Bridge Híbrida: Opus (cérebro) ↔ RTX 4090 (processamento)
+# ============================================================================
+#
+# ARQUITETURA HÍBRIDA:
+#   Opus (Copilot) RACIOCINA → gpu EXECUTA → Opus LÊ resultado → Opus DECIDE
+#
+# MODELO ÚNICO — Qwen3-Coder-30B-MoE abliterated:
+#   • 30B params totais, 128 experts, 3.3B ativados por token
+#   • 178 tok/s — mais rápido que 7B dense (160 tok/s) com qualidade de 30B
+#   • Zero censura (abliteration nos weights)
+#   • 32K context window ativo (256K nativo, 32K = sweet spot VRAM)
+#   • Override: GPU_MODEL=modelo gpu comando
+#
+# v5.0 Mudanças:
+#   - Context window: 8K → 32K (4x mais conteúdo, zero perda de speed)
+#   - Content limits: 2-3x maiores em todos os comandos
+#   - Keep Alive: infinito (modelo nunca descarrega — é o único)
+#   - Cache expandido: scan, search-vuln, diff agora com cache
+#   - Temperature por comando (0.05 classify → 0.3 ask)
+#   - Retry automático (1x) em falhas transitórias
+#   - Fix: timer bug no classify cache hit
+#   - GPU Persistence Mode via systemd
+#   - Código morto removido (resolve_model inline)
+#
+# Modos:
+#   gpu ask "pergunta qualquer"              → resposta rápida
+#   gpu scan <arquivo> "o que procurar"      → varre arquivo
+#   gpu classify <arquivo>                   → classifica crash/log
+#   gpu summarize <arquivo>                  → resume arquivo
+#   gpu triage <bugreport.zip|log>           → pipeline completo Android
+#   gpu search-vuln <arquivo> "contexto"     → auditoria segurança
+#   gpu bulk [-r] <pasta> "instrução"        → batch processing
+#   gpu diff <file1> <file2> "foco"          → compara arquivos
+#   gpu stats                                → status completo do sistema
+#
+# Tudo roda na GPU local. Resultado vai para stdout (Opus lê e decide).
+# ============================================================================
+
+set -euo pipefail
+
+# ─── Config ─────────────────────────────────────────────────────────────────
+VERSION="5.1"
+KALI_SAFE="/mnt/winraid/__KALI_SAFE"
+export OLLAMA_MODELS="${KALI_SAFE}/models"
+HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+CURL_TIMEOUT="${GPU_TIMEOUT:-180}"      # timeout total
+CURL_CONNECT_TIMEOUT=5                  # timeout de conexão
+MAX_RETRIES=1                           # retry automático em falhas transitórias
+
+# Modelo único: Qwen3-Coder-30B-MoE abliterated
+# MoE (128 experts, 8 active) = velocidade de 3B + conhecimento de 30B
+# Abliterated = censura removida nos weights (não só no prompt)
+MODEL="${GPU_MODEL:-huihui_ai/qwen3-coder-abliterated:30b}"  # 178 tok/s, 20GB VRAM, zero censura
+
+# Context window: 32K = sweet spot (93.5% VRAM, zero speed loss vs 8K)
+# Modelo suporta 256K nativo mas 32K é o máximo que cabe na 4090 com margem
+NUM_CTX=32768
+
+# Cache de resultados no RAID
+CACHE_DIR="${KALI_SAFE}/caches/gpu"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+# Limites de conteúdo por comando (calibrados para 32K context window)
+# Formula: (NUM_CTX - system_prompt_tokens - predict_tokens) * ~3.5 chars/token
+CHARS_SMALL=8000        # classify, ask (sobra margem para system prompt longo)
+CHARS_MEDIUM=48000      # scan (32K ctx = ~28K tokens disponíveis para input)
+CHARS_LARGE=80000       # summarize (maximiza conteúdo analisado)
+CHARS_BULK=12000        # bulk (por arquivo, 2x mais que antes)
+CHARS_VULN=64000        # search-vuln (3.2x mais contexto = auditoria profunda)
+CHARS_DIFF=32000        # diff (cada arquivo = metade do limite)
+
+# Tokens de resposta por comando
+PREDICT_SMALL=512       # classify (JSON curto)
+PREDICT_MEDIUM=1024     # ask, scan
+PREDICT_LARGE=2048      # summarize
+PREDICT_VULN=3072       # search-vuln (relatório detalhado)
+PREDICT_BULK=512        # bulk (por arquivo)
+
+# Temperature por comando (otimizada por tipo de tarefa)
+TEMP_DETERMINISTIC=0.05 # classify — JSON preciso, zero criatividade
+TEMP_ANALYTICAL=0.1     # scan, vuln, diff — análise metódica
+TEMP_BALANCED=0.2       # summarize, bulk — equilíbrio
+TEMP_CREATIVE=0.3       # ask — perguntas abertas, mais natural
+
+# ─── Cores (só stderr) ─────────────────────────────────────────────────────
+if [[ -t 2 ]]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_BLUE='\033[0;34m'
+    C_CYAN='\033[0;36m'
+    C_BOLD='\033[1m'
+    C_DIM='\033[2m'
+    C_RESET='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_CYAN='' C_BOLD='' C_DIM='' C_RESET=''
+fi
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+log_info()  { echo -e "${C_BLUE}[gpu]${C_RESET} $*" >&2; }
+log_ok()    { echo -e "${C_GREEN}[gpu]${C_RESET} $*" >&2; }
+log_warn()  { echo -e "${C_YELLOW}[gpu]${C_RESET} $*" >&2; }
+log_err()   { echo -e "${C_RED}[gpu]${C_RESET} $*" >&2; }
+log_dim()   { echo -e "${C_DIM}[gpu] $*${C_RESET}" >&2; }
+
+# Timer helpers
+_timer_start() { _GPU_START=$(date +%s%N); }
+_timer_end() {
+    local elapsed=$(( ($(date +%s%N) - _GPU_START) / 1000000 ))
+    if (( elapsed > 1000 )); then
+        log_dim "⏱ $(( elapsed / 1000 )).$(( (elapsed % 1000) / 100 ))s"
+    else
+        log_dim "⏱ ${elapsed}ms"
+    fi
+}
+
+ensure_ollama() {
+    # Rápido: testa conexão
+    if curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT" "${HOST}/api/tags" &>/dev/null; then
+        validate_model
+        return 0
+    fi
+
+    log_warn "Ollama offline. Tentando iniciar..."
+
+    # Tenta systemctl (sem sudo se possível)
+    if systemctl start ollama 2>/dev/null || sudo systemctl start ollama 2>/dev/null; then
+        # Retry com backoff
+        local attempt
+        for attempt in 1 2 3 4 5; do
+            sleep "$attempt"
+            if curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT" "${HOST}/api/tags" &>/dev/null; then
+                log_ok "Ollama iniciado (tentativa ${attempt})"
+                validate_model
+                return 0
+            fi
+        done
+    fi
+
+    log_err "FATAL: Não consegui iniciar Ollama em ${HOST}"
+    exit 1
+}
+
+validate_model() {
+    local available
+    available=$(curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT" "${HOST}/api/tags" 2>/dev/null \
+        | jq -r '.models[]?.name // empty' 2>/dev/null)
+
+    if [[ -z "$available" ]]; then
+        log_err "Nenhum modelo disponível no Ollama"
+        exit 1
+    fi
+
+    if ! echo "$available" | grep -qF "$MODEL"; then
+        log_warn "Modelo '${MODEL}' não encontrado. Disponíveis:"
+        echo "$available" | while read -r m; do log_warn "  → $m"; done
+        # Tenta usar o primeiro disponível
+        MODEL=$(echo "$available" | head -1)
+        log_warn "Usando fallback: ${MODEL}"
+    fi
+}
+
+require_file() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        log_err "Arquivo não encontrado: $file"
+        exit 1
+    fi
+    if [[ ! -r "$file" ]]; then
+        log_err "Sem permissão de leitura: $file"
+        exit 1
+    fi
+    if is_binary "$file"; then
+        log_err "Arquivo binário não suportado: $file"
+        exit 1
+    fi
+}
+
+require_dir() {
+    local dir="$1"
+    if [[ ! -d "$dir" ]]; then
+        log_err "Diretório não encontrado: $dir"
+        exit 1
+    fi
+}
+
+is_binary() {
+    # Detecta arquivos binários (imagens, executáveis, etc)
+    local file="$1"
+    local mime
+    mime=$(file --mime-encoding -b "$file" 2>/dev/null)
+    [[ "$mime" == "binary" ]]
+}
+
+file_size_human() {
+    local file="$1"
+    local bytes
+    bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    if (( bytes > 1048576 )); then
+        echo "$(( bytes / 1048576 ))MB"
+    elif (( bytes > 1024 )); then
+        echo "$(( bytes / 1024 ))KB"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+# Extração inteligente de conteúdo:
+# - Arquivos pequenos: conteúdo completo
+# - Arquivos grandes: head + tail (para não perder o final)
+smart_extract() {
+    local file="$1"
+    local max_chars="${2:-$CHARS_MEDIUM}"
+    local total_lines
+
+    total_lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+
+    if (( $(stat -c%s "$file") <= max_chars )); then
+        # Arquivo inteiro cabe
+        cat "$file"
+    else
+        # Split: 70% head, 30% tail
+        local head_chars=$(( max_chars * 70 / 100 ))
+        local tail_chars=$(( max_chars * 30 / 100 ))
+
+        head -c "$head_chars" "$file"
+        echo ""
+        echo ""
+        echo "... [TRUNCATED — showing first ${head_chars} + last ${tail_chars} chars of ${total_lines} lines] ..."
+        echo ""
+        tail -c "$tail_chars" "$file"
+    fi
+}
+
+# Cache key baseada em: arquivo + comando + modelo
+cache_key() {
+    local file="$1"
+    local cmd="$2"
+    local model="$3"
+    local mtime
+    mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
+    echo "${cmd}_$(echo "${file}_${mtime}_${model}" | md5sum | cut -c1-16)"
+}
+
+cache_get() {
+    local key="$1"
+    local cache_file="${CACHE_DIR}/${key}.txt"
+    if [[ -f "$cache_file" ]]; then
+        # Cache válido por 24h
+        local age=$(( $(date +%s) - $(stat -c%Y "$cache_file") ))
+        if (( age < 86400 )); then
+            log_dim "Cache hit: ${key} (age: ${age}s)"
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+cache_put() {
+    local key="$1"
+    local content="$2"
+    echo "$content" > "${CACHE_DIR}/${key}.txt" 2>/dev/null || true
+}
+
+# Core query function — fix SIGPIPE capturando em variável
+# $1=system_prompt  $2=user_prompt  $3=num_predict  $4=temperature
+ollama_query() {
+    local system_prompt="$1"
+    local user_prompt="$2"
+    local num_predict="${3:-$PREDICT_MEDIUM}"
+    local temperature="${4:-$TEMP_ANALYTICAL}"
+
+    log_dim "Modelo: ${MODEL} | ctx:${NUM_CTX} temp:${temperature}"
+
+    local payload
+    payload=$(jq -n \
+        --arg model "$MODEL" \
+        --arg system "$system_prompt" \
+        --arg prompt "$user_prompt" \
+        --argjson predict "$num_predict" \
+        --argjson temp "$temperature" \
+        --argjson ctx "$NUM_CTX" \
+        '{
+            model: $model,
+            system: $system,
+            prompt: $prompt,
+            stream: false,
+            options: {
+                temperature: $temp,
+                num_predict: $predict,
+                num_ctx: $ctx
+            }
+        }')
+
+    # Retry loop — falhas transitórias (cold start, timeout)
+    local attempt raw_response exit_code
+    for attempt in $(seq 0 "$MAX_RETRIES"); do
+        if (( attempt > 0 )); then
+            log_warn "Retry ${attempt}/${MAX_RETRIES}..."
+            sleep 2
+        fi
+
+        # Captura output em variável — NUNCA pipe direto (evita SIGPIPE)
+        raw_response=$(curl -sf \
+            --connect-timeout "$CURL_CONNECT_TIMEOUT" \
+            --max-time "$CURL_TIMEOUT" \
+            "${HOST}/api/generate" \
+            -d "$payload" 2>/dev/null) && break
+
+        exit_code=$?
+        if (( exit_code == 28 )); then
+            log_err "Timeout após ${CURL_TIMEOUT}s (tentativa $((attempt+1)))"
+        else
+            log_err "curl falhou (exit $exit_code, tentativa $((attempt+1)))"
+        fi
+    done
+
+    if [[ -z "${raw_response:-}" ]]; then
+        log_err "Todas as tentativas falharam. Ollama rodando?"
+        return 1
+    fi
+
+    # Extrai .response e métricas
+    local response
+    response=$(echo "$raw_response" | jq -r '.response // empty' 2>/dev/null)
+
+    # Log de tokens usados (para o Opus acompanhar eficiência)
+    local eval_count eval_duration prompt_eval_count
+    eval_count=$(echo "$raw_response" | jq -r '.eval_count // 0' 2>/dev/null)
+    eval_duration=$(echo "$raw_response" | jq -r '.eval_duration // 0' 2>/dev/null)
+    prompt_eval_count=$(echo "$raw_response" | jq -r '.prompt_eval_count // 0' 2>/dev/null)
+    if (( eval_duration > 0 )); then
+        local tokens_per_sec=$(( eval_count * 1000000000 / eval_duration ))
+        log_dim "Tokens: ${eval_count} (prompt:${prompt_eval_count}) | Speed: ${tokens_per_sec} tok/s"
+    fi
+
+    if [[ -z "$response" ]]; then
+        # Fallback: tenta pegar erro
+        local err
+        err=$(echo "$raw_response" | jq -r '.error // empty' 2>/dev/null)
+        if [[ -n "$err" ]]; then
+            log_err "Ollama error: $err"
+        else
+            log_err "Resposta vazia do Ollama"
+            log_dim "Raw: $(echo "$raw_response" | head -c 200)"
+        fi
+        return 1
+    fi
+
+    echo "$response"
+}
+
+# ─── Commands ───────────────────────────────────────────────────────────────
+
+cmd_ask() {
+    local question="$*"
+    [[ -z "$question" ]] && { log_err "Uso: gpu ask \"pergunta\""; exit 1; }
+    ensure_ollama
+
+    _timer_start
+    ollama_query \
+        "You are a concise technical assistant. Answer directly, no fluff. Use structured formatting when helpful." \
+        "$question" \
+        "$PREDICT_MEDIUM" \
+        "$TEMP_CREATIVE"
+    _timer_end
+}
+
+cmd_scan() {
+    local file="${1:-}"
+    [[ -z "$file" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit 1; }
+    shift
+    local query="$*"
+    [[ -z "$query" ]] && { log_err "Uso: gpu scan <arquivo> \"o que procurar\""; exit 1; }
+
+    require_file "$file"
+    ensure_ollama
+
+    local size
+    size=$(file_size_human "$file")
+    local lines
+    lines=$(wc -l < "$file")
+    log_info "Scanning ${file} (${size}, ${lines}L) for: ${query}"
+
+    local content
+    content=$(smart_extract "$file" "$CHARS_MEDIUM")
+
+    # Cache: mesmo arquivo + mesma query = mesmo resultado
+    local ckey
+    ckey=$(cache_key "$file" "scan_$(echo "$query" | md5sum | cut -c1-8)" "$MODEL")
+    if cache_get "$ckey"; then
+        return 0
+    fi
+
+    _timer_start
+    local result
+    result=$(ollama_query \
+        "You scan files for specific patterns. Be precise and thorough. Return findings as a structured list with line references when possible. Mention if the file was truncated and findings might be incomplete." \
+        "Scan this file for: ${query}
+
+File: $(basename "$file") | Size: ${size} | Lines: ${lines}
+
+--- FILE CONTENT ---
+${content}
+--- END ---" \
+        "$PREDICT_MEDIUM" \
+        "$TEMP_ANALYTICAL")
+    echo "$result"
+    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_classify() {
+    local file="${1:-}"
+    [[ -z "$file" ]] && { log_err "Uso: gpu classify <arquivo>"; exit 1; }
+
+    require_file "$file"
+    ensure_ollama
+
+    log_info "Classifying $(basename "$file") ($(file_size_human "$file"))"
+
+    local content
+    content=$(smart_extract "$file" "$CHARS_SMALL")
+
+    # Cache: classify muda pouco
+    local ckey
+    ckey=$(cache_key "$file" "classify" "$MODEL")
+    if cache_get "$ckey"; then
+        return 0
+    fi
+
+    _timer_start
+    local result
+    result=$(ollama_query \
+        'You classify crash/log/error snippets. Return ONLY valid JSON with this exact structure: {"type": "crash|error|warning|info|mixed", "severity": "critical|high|medium|low", "subsystem": "component name", "root_cause": "1 line", "summary": "1 line description", "actionable": true/false}' \
+        "Classify this file:
+
+${content}" \
+        "$PREDICT_SMALL" \
+        "$TEMP_DETERMINISTIC")
+    echo "$result"
+    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_summarize() {
+    local file="${1:-}"
+    [[ -z "$file" ]] && { log_err "Uso: gpu summarize <arquivo>"; exit 1; }
+
+    require_file "$file"
+    ensure_ollama
+
+    local size
+    size=$(file_size_human "$file")
+    local lines
+    lines=$(wc -l < "$file")
+    log_info "Summarizing $(basename "$file") (${size}, ${lines}L)"
+
+    local content
+    content=$(smart_extract "$file" "$CHARS_LARGE")
+
+    # Cache: evita reprocessar o mesmo arquivo
+    local ckey
+    ckey=$(cache_key "$file" "summarize" "$MODEL")
+    if cache_get "$ckey"; then
+        return 0
+    fi
+
+    _timer_start
+    local result
+    result=$(ollama_query \
+        "You are a technical writer creating an executive summary. Analyze the document and extract the key information, structure, patterns, and notable entries. Present a well-organized summary." \
+        "Create a structured summary of this technical document (${lines} lines total, ${size}). List the main topics covered, key data points, and any items requiring attention:
+
+${content}" \
+        "$PREDICT_LARGE" \
+        "$TEMP_BALANCED")
+    echo "$result"
+    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_triage() {
+    local input="${1:-}"
+    [[ -z "$input" ]] && { log_err "Uso: gpu triage <bugreport.zip|logfile>"; exit 1; }
+
+    if [[ ! -f "$input" ]]; then
+        log_err "Arquivo não encontrado: $input"
+        exit 1
+    fi
+
+    local triage_script="${KALI_SAFE}/scripts/triage.py"
+    if [[ ! -f "$triage_script" ]]; then
+        log_err "triage.py não encontrado em: $triage_script"
+        log_warn "Alternativa: use 'gpu classify' ou 'gpu summarize' para análise direta"
+        exit 1
+    fi
+
+    log_info "Running full triage pipeline on $(basename "$input")..."
+    _timer_start
+
+    if [[ "$input" == *.zip ]]; then
+        python3 "$triage_script" --bugreport "$input"
+    else
+        python3 "$triage_script" --logcat "$input"
+    fi
+    _timer_end
+}
+
+cmd_search_vuln() {
+    local file="${1:-}"
+    [[ -z "$file" ]] && { log_err "Uso: gpu search-vuln <arquivo> \"contexto\""; exit 1; }
+    shift
+    local context="${*:-general security audit}"
+
+    require_file "$file"
+    ensure_ollama
+
+    local size
+    size=$(file_size_human "$file")
+    log_info "Vulnerability scan: $(basename "$file") (${size}) | Context: ${context}"
+
+    # Contexto expandido para vuln research
+    local content
+    content=$(smart_extract "$file" "$CHARS_VULN")
+
+    # Cache: mesma auditoria no mesmo arquivo = mesmo resultado
+    local ckey
+    ckey=$(cache_key "$file" "vuln_$(echo "$context" | md5sum | cut -c1-8)" "$MODEL")
+    if cache_get "$ckey"; then
+        return 0
+    fi
+
+    _timer_start
+    local result
+    result=$(ollama_query \
+        "You are a software security engineer performing a code review. Analyze the provided source code, configuration, or log file for potential security weaknesses. For each finding provide:
+
+**Format per finding:**
+- **ID**: FINDING-N
+- **Severity**: CRITICAL / HIGH / MEDIUM / LOW / INFO
+- **Category**: (e.g., input validation, access control, cryptography, config, information exposure)
+- **Location**: line number or section
+- **Description**: technical description of the weakness
+- **Impact**: potential consequences if exploited
+- **Recommendation**: how to remediate
+
+Focus on: input validation gaps, access control issues, cryptographic weaknesses, configuration problems, information exposure, error handling, race conditions, and hardcoded credentials.
+
+End with a findings summary by severity." \
+        "Security code review of: $(basename "$file")
+Context: ${context}
+File type: $(file -b "$file" 2>/dev/null || echo unknown)
+
+--- CONTENT ---
+${content}
+--- END ---" \
+        "$PREDICT_VULN" \
+        "$TEMP_ANALYTICAL")
+    echo "$result"
+    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_bulk() {
+    local recursive=false
+    # Parse -r flag
+    if [[ "${1:-}" == "-r" ]]; then
+        recursive=true
+        shift
+    fi
+
+    local dir="${1:-}"
+    [[ -z "$dir" ]] && { log_err "Uso: gpu bulk [-r] <dir> \"instrução\""; exit 1; }
+    shift
+    local instruction="$*"
+    [[ -z "$instruction" ]] && { log_err "Uso: gpu bulk [-r] <dir> \"instrução\""; exit 1; }
+
+    require_dir "$dir"
+    ensure_ollama
+
+    _timer_start
+
+    echo "## Bulk Analysis: $(basename "$dir")"
+    echo "**Instruction**: ${instruction}"
+    echo ""
+
+    local count=0
+    local skipped=0
+    local files=()
+
+    # Coleta arquivos (recursivo ou não)
+    if $recursive; then
+        while IFS= read -r -d '' f; do
+            files+=("$f")
+        done < <(find "$dir" -type f -print0 2>/dev/null | sort -z)
+    else
+        for f in "$dir"/*; do
+            [[ -f "$f" ]] && files+=("$f")
+        done
+    fi
+
+    local total=${#files[@]}
+    log_info "Found ${total} files in $(basename "$dir") $(${recursive} && echo '(recursive)' || echo '')"
+
+    for f in "${files[@]}"; do
+        # Skip binários
+        if is_binary "$f"; then
+            ((skipped++))
+            log_dim "Skip (binary): $(basename "$f")"
+            continue
+        fi
+
+        # Skip arquivos vazios
+        if [[ ! -s "$f" ]]; then
+            ((skipped++))
+            log_dim "Skip (empty): $(basename "$f")"
+            continue
+        fi
+
+        ((count++))
+        local relpath="${f#$dir/}"
+        log_info "[${count}/${total}] Processing: ${relpath}"
+
+        echo "### ${relpath}"
+        echo ""
+
+        local content
+        content=$(smart_extract "$f" "$CHARS_BULK")
+
+        ollama_query \
+            "You process files according to instructions. Be concise and structured." \
+            "Instruction: ${instruction}
+
+--- FILE: ${relpath} ($(file_size_human "$f")) ---
+${content}
+--- END ---" \
+            "$PREDICT_BULK" \
+            "$TEMP_BALANCED"
+
+        echo ""
+        echo "---"
+        echo ""
+    done
+
+    echo ""
+    echo "**Total**: ${count} processed, ${skipped} skipped"
+    log_ok "Bulk complete: ${count} processed, ${skipped} skipped"
+    _timer_end
+}
+
+cmd_diff() {
+    local file1="${1:-}"
+    local file2="${2:-}"
+    [[ -z "$file1" || -z "$file2" ]] && { log_err "Uso: gpu diff <file1> <file2> [\"foco\"]"; exit 1; }
+    shift 2
+    local focus="${*:-general comparison}"
+
+    require_file "$file1"
+    require_file "$file2"
+    ensure_ollama
+
+    log_info "Comparing: $(basename "$file1") vs $(basename "$file2")"
+
+    local content1 content2
+    content1=$(smart_extract "$file1" "$CHARS_DIFF")
+    content2=$(smart_extract "$file2" "$CHARS_DIFF")
+
+    # Cache: mesmos 2 ficheiros = mesmo diff
+    local ckey
+    ckey=$(cache_key "$file1" "diff_$(echo "${file2}_${focus}" | md5sum | cut -c1-8)" "$MODEL")
+    if cache_get "$ckey"; then
+        return 0
+    fi
+
+    _timer_start
+    local result
+    result=$(ollama_query \
+        "You compare two files and highlight meaningful differences. Focus on: structural changes, added/removed functionality, security implications, and potential issues. Be concise." \
+        "Compare these files. Focus: ${focus}
+
+--- FILE 1: $(basename "$file1") ($(file_size_human "$file1")) ---
+${content1}
+--- END FILE 1 ---
+
+--- FILE 2: $(basename "$file2") ($(file_size_human "$file2")) ---
+${content2}
+--- END FILE 2 ---" \
+        "$PREDICT_LARGE" \
+        "$TEMP_ANALYTICAL")
+    echo "$result"
+    [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_stats() {
+    echo "## gpu Bridge v${VERSION} — System Stats"
+    echo ""
+
+    # Ollama status
+    if curl -sf --connect-timeout 2 "${HOST}/api/tags" &>/dev/null; then
+        echo "**Ollama**: ✅ Online (${HOST})"
+        local models
+        models=$(curl -sf "${HOST}/api/tags" | jq -r '.models[]? | "  - \(.name) (\(.details.parameter_size // "?") \(.details.quantization_level // ""))"' 2>/dev/null)
+        echo "**Models**:"
+        echo "$models"
+    else
+        echo "**Ollama**: ❌ Offline"
+    fi
+    echo ""
+
+    # GPU status
+    if command -v nvidia-smi &>/dev/null; then
+        echo "**GPU**:"
+        nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total \
+            --format=csv,noheader,nounits 2>/dev/null | \
+            awk -F', ' '{printf "  - %s | Temp: %s°C | Load: %s%% | VRAM: %s/%sMB\n", $1, $2, $3, $4, $5}'
+    fi
+    echo ""
+
+    # Model config (dinâmico via /api/ps)
+    echo "**Model**:"
+    echo "  - Active: ${MODEL}"
+    local model_info
+    model_info=$(curl -sf --connect-timeout 2 "${HOST}/api/ps" 2>/dev/null)
+    if [[ -n "$model_info" ]]; then
+        local vram_mb family ctx_loaded
+        vram_mb=$(echo "$model_info" | jq -r '.models[0].size_vram // 0' 2>/dev/null)
+        vram_mb=$(( vram_mb / 1048576 ))
+        family=$(echo "$model_info" | jq -r '.models[0].details.family // "unknown"' 2>/dev/null)
+        ctx_loaded=$(echo "$model_info" | jq -r '.models[0].context_length // 0' 2>/dev/null)
+        echo "  - Family: ${family} | Context loaded: ${ctx_loaded} | VRAM: ${vram_mb}MB"
+    else
+        echo "  - (modelo não carregado)"
+    fi
+    echo ""
+
+    # Cache stats
+    local cache_count cache_size
+    cache_count=$(find "$CACHE_DIR" -name '*.txt' 2>/dev/null | wc -l)
+    cache_size=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
+    echo "**Cache**:"
+    echo "  - Location: ${CACHE_DIR}"
+    echo "  - Entries: ${cache_count} (${cache_size:-0})"
+    echo ""
+
+    # RAID storage
+    echo "**RAID Storage**:"
+    df -h /mnt/winraid/ 2>/dev/null | tail -1 | awk '{printf "  - Total: %s | Used: %s (%s) | Free: %s\n", $2, $3, $5, $4}'
+    echo ""
+
+    # Config
+    echo "**Config**:"
+    echo "  - Version: ${VERSION}"
+    echo "  - Timeout: ${CURL_TIMEOUT}s"
+    echo "  - Content limits: small=${CHARS_SMALL} med=${CHARS_MEDIUM} large=${CHARS_LARGE} vuln=${CHARS_VULN} diff=${CHARS_DIFF}"
+    echo "  - Temperatures: deterministic=${TEMP_DETERMINISTIC} analytical=${TEMP_ANALYTICAL} balanced=${TEMP_BALANCED} creative=${TEMP_CREATIVE}"
+    echo "  - Retry: ${MAX_RETRIES}x"
+    echo "  - OLLAMA_MODELS: ${OLLAMA_MODELS}"
+    echo ""
+
+    # Ollama optimizations (from systemd override)
+    echo "**Optimizations**:"
+    local ollama_pid
+    ollama_pid=$(pgrep -x ollama 2>/dev/null | head -1)
+    if [[ -n "$ollama_pid" ]]; then
+        local env_data
+        env_data=$(sudo cat /proc/${ollama_pid}/environ 2>/dev/null | tr '\0' '\n')
+        local fa kv ka np tmpdir
+        fa=$(echo "$env_data" | command grep -oP 'OLLAMA_FLASH_ATTENTION=\K.*' 2>/dev/null || echo "?")
+        kv=$(echo "$env_data" | command grep -oP 'OLLAMA_KV_CACHE_TYPE=\K.*' 2>/dev/null || echo "?")
+        ka=$(echo "$env_data" | command grep -oP 'OLLAMA_KEEP_ALIVE=\K.*' 2>/dev/null || echo "?")
+        np=$(echo "$env_data" | command grep -oP 'OLLAMA_NUM_PARALLEL=\K.*' 2>/dev/null || echo "?")
+        tmpdir=$(echo "$env_data" | command grep -oP 'OLLAMA_TMPDIR=\K.*' 2>/dev/null || echo "?")
+        echo "  - Flash Attention: ${fa}"
+        echo "  - KV Cache Type: ${kv}"
+        echo "  - Keep Alive: ${ka}"
+        echo "  - Parallel Requests: ${np}"
+        echo "  - TMPDIR: ${tmpdir}"
+    else
+        echo "  - (Ollama não está rodando)"
+    fi
+}
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+    ask)          cmd_ask "$@" ;;
+    scan)         cmd_scan "$@" ;;
+    classify)     cmd_classify "$@" ;;
+    summarize)    cmd_summarize "$@" ;;
+    triage)       cmd_triage "$@" ;;
+    search-vuln)  cmd_search_vuln "$@" ;;
+    bulk)         cmd_bulk "$@" ;;
+    diff)         cmd_diff "$@" ;;
+    stats)        cmd_stats ;;
+    -v|--version) echo "gpu v${VERSION}" ;;
+    -h|--help|help|"")
+        echo -e "${C_BOLD}gpu v${VERSION}${C_RESET} — Bridge Híbrida Opus↔RTX4090"
+        echo ""
+        echo -e "${C_CYAN}Arquitetura:${C_RESET}  Opus raciocina → GPU executa → Opus lê → Opus decide"
+        echo -e "${C_CYAN}Modelo:${C_RESET}       Qwen3-Coder-30B-MoE abliterated (178 tok/s, zero censura)"
+        echo ""
+        echo -e "${C_CYAN}Comandos:${C_RESET}"
+        echo "  gpu ask \"pergunta\"                   Pergunta rápida"
+        echo "  gpu scan <file> \"query\"              Varre arquivo"
+        echo "  gpu classify <file>                  Classifica crash/log"
+        echo "  gpu summarize <file>                 Resume arquivo grande"
+        echo "  gpu triage <bugreport.zip|log>       Pipeline completo Android"
+        echo "  gpu search-vuln <file> \"contexto\"    Auditoria de segurança"
+        echo "  gpu bulk [-r] <dir> \"instrução\"      Processa pasta inteira"
+        echo "  gpu diff <f1> <f2> \"foco\"            Compara dois arquivos"
+        echo "  gpu stats                            Status do sistema"
+        echo ""
+        echo -e "${C_CYAN}Exemplos:${C_RESET}"
+        echo "  gpu ask \"how to decode base64 in python\""
+        echo "  gpu scan crash.log \"null pointer\""
+        echo "  gpu summarize /var/log/syslog"
+        echo "  gpu search-vuln app.py \"REST API\""
+        echo "  gpu bulk -r src/ \"find TODO comments\""
+        echo "  gpu diff old.conf new.conf \"security changes\""
+        echo ""
+        echo -e "${C_CYAN}Env:${C_RESET}"
+        echo "  GPU_MODEL=modelo             Override modelo (default: qwen3-coder:30b)"
+        echo "  OLLAMA_HOST=http://...       Host Ollama (default: localhost:11434)"
+        echo "  GPU_TIMEOUT=180              Timeout em segundos"
+        ;;
+    *)
+        log_err "Comando desconhecido: $CMD"
+        echo "Use: gpu --help" >&2
+        exit 1
+        ;;
+esac

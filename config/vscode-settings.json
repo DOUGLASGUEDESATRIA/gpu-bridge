@@ -1,0 +1,29 @@
+{
+    "github.copilot.nextEditSuggestions.enabled": true,
+    "workbench.colorTheme": "Experimental Dark",
+    "files.autoSave": "afterDelay",
+    "chat.tools.global.autoApprove": true,
+    "chat.agent.maxRequests": 1000,
+    "redhat.telemetry.enabled": true,
+    "security.workspace.trust.untrustedFiles": "open",
+    "chat.viewSessions.orientation": "stacked",
+    "diffEditor.maxComputationTime": 0,
+    "terminal.integrated.shellIntegration.enabled": true,
+    "workbench.startupEditor": "none",
+    "github.copilot.enable": {
+        "*": true,
+        "plaintext": true,
+        "markdown": false,
+        "scminput": false
+    },
+    "window.dialogStyle": "custom",
+    "window.titleBarStyle": "custom",
+    "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+    "github.copilot.chat.codeGeneration.instructions": [
+        { "file": "/mnt/winraid/__KALI_SAFE/copilot-instructions.md" }
+    ],
+    "github.copilot.chat.instructions": [
+        { "file": "/mnt/winraid/__KALI_SAFE/copilot-instructions.md" }
+    ],
+    "chat.promptFiles": true
+}
