@@ -1148,6 +1148,45 @@ cmd_stats() {
     fi
 }
 
+cmd_bench() {
+    ensure_ollama
+    log_info "Benchmark: disparando query curta para medir tok/s..."
+    _timer_start
+    local raw
+    raw=$(curl -sf --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time 30 \
+        "${HOST}/api/generate" \
+        -d "$(jq -n --arg model "$MODEL" --argjson ctx "$NUM_CTX" '{
+            model: $model,
+            system: "Respond with exactly 100 words about binary exploitation.",
+            prompt: "Go.",
+            stream: false,
+            options: { temperature: 0.3, num_predict: 200, num_ctx: $ctx }
+        }')" 2>/dev/null)
+
+    if [[ -z "$raw" ]]; then
+        log_err "Benchmark falhou — Ollama não respondeu"
+        return $EX_TIMEOUT
+    fi
+
+    local eval_count eval_duration prompt_eval_count prompt_duration
+    eval_count=$(echo "$raw" | jq -r '.eval_count // 0')
+    eval_duration=$(echo "$raw" | jq -r '.eval_duration // 0')
+    prompt_eval_count=$(echo "$raw" | jq -r '.prompt_eval_count // 0')
+    prompt_duration=$(echo "$raw" | jq -r '.prompt_eval_duration // 0')
+
+    echo "## Benchmark Results"
+    echo "**Model**: ${MODEL}"
+    if (( eval_duration > 0 )); then
+        local gen_tps=$(( eval_count * 1000000000 / eval_duration ))
+        echo "**Generation**: ${eval_count} tokens @ **${gen_tps} tok/s**"
+    fi
+    if (( prompt_duration > 0 )); then
+        local prompt_tps=$(( prompt_eval_count * 1000000000 / prompt_duration ))
+        echo "**Prompt eval**: ${prompt_eval_count} tokens @ ${prompt_tps} tok/s"
+    fi
+    _timer_end
+}
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 # Parse global flags
@@ -1173,6 +1212,7 @@ case "$CMD" in
     pipe)         cmd_pipe "$@" ;;
     diff)         cmd_diff "$@" ;;
     cache-clean)  cmd_cache_clean ;;
+    bench)        cmd_bench ;;
     stats)        cmd_stats ;;
     -v|--version) echo "gpu v${VERSION}" ;;
     -h|--help|help|"")
@@ -1193,6 +1233,7 @@ case "$CMD" in
         echo "  gpu pipe \"instrução\"                 Pipeline: stdin → GPU → stdout"
         echo "  gpu diff <f1> <f2> \"foco\"            Compara dois arquivos"
         echo "  gpu cache-clean                      Remove cache expirado (>24h)"
+        echo "  gpu bench                            Benchmark rápido (mede tok/s real)"
         echo "  gpu stats                            Status do sistema"
         echo ""
         echo -e "${C_CYAN}Exemplos:${C_RESET}"

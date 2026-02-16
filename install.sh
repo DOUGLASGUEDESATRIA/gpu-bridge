@@ -43,6 +43,18 @@ echo "📝 Instalando Copilot instructions..."
 cp "$SCRIPT_DIR/config/copilot-instructions.md" "$KALI_SAFE/copilot-instructions.md"
 echo "  → $KALI_SAFE/copilot-instructions.md"
 
+# 5b. Zsh completions
+echo "🔤 Instalando Zsh completions..."
+if [[ -d /usr/local/share/zsh/site-functions ]]; then
+    sudo cp "$SCRIPT_DIR/completions/_gpu" /usr/local/share/zsh/site-functions/_gpu
+    echo "  → /usr/local/share/zsh/site-functions/_gpu"
+else
+    mkdir -p ~/.zsh/completions
+    cp "$SCRIPT_DIR/completions/_gpu" ~/.zsh/completions/_gpu
+    echo "  → ~/.zsh/completions/_gpu"
+    echo "  ⚠️  Adicione ao .zshrc: fpath=(~/.zsh/completions \$fpath)"
+fi
+
 # 6. Verificar Ollama
 if command -v ollama &>/dev/null; then
     echo "✅ Ollama encontrado: $(ollama --version 2>&1 | head -1)"

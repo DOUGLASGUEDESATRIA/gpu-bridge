@@ -1,0 +1,93 @@
+#compdef gpu
+# Zsh completion for gpu v6.1 — Bridge Híbrida Opus↔RTX4090
+
+_gpu_commands() {
+    local -a commands=(
+        'ask:Pergunta rápida à GPU'
+        'scan:Varre arquivo extraindo padrões'
+        'classify:Classifica crash/log (JSON forçado)'
+        'summarize:Resume arquivo grande'
+        'triage:Pipeline completo Android (bugreport/logcat)'
+        'search-vuln:Auditoria de segurança em código'
+        'bulk:Processa pasta inteira (-r recursivo, -p paralelo)'
+        'chunk:Auto-fatia + paralelo + agrega resultados'
+        'pipe:Pipeline stdin → GPU → stdout'
+        'diff:Compara dois arquivos'
+        'cache-clean:Remove cache expirado (>24h)'
+        'bench:Benchmark rápido — mede tok/s real'
+        'stats:Status do sistema (GPU, modelo, cache, RAID)'
+        'help:Mostra ajuda'
+    )
+    _describe 'command' commands
+}
+
+_gpu() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -C \
+        '--no-cache[Ignora cache, força reprocessamento]' \
+        '-v[Mostra versão]' \
+        '--version[Mostra versão]' \
+        '-h[Mostra ajuda]' \
+        '--help[Mostra ajuda]' \
+        '1:command:_gpu_commands' \
+        '*::arg:->args'
+
+    case $state in
+        args)
+            case ${words[1]} in
+                ask)
+                    _arguments '1:pergunta:'
+                    ;;
+                scan)
+                    _arguments \
+                        '1:arquivo:_files' \
+                        '2:query:'
+                    ;;
+                classify)
+                    _arguments '1:arquivo:_files'
+                    ;;
+                summarize)
+                    _arguments '1:arquivo:_files'
+                    ;;
+                triage)
+                    _arguments '1:bugreport/log:_files -g "*(*.zip|*.log|*.txt)"'
+                    ;;
+                search-vuln)
+                    _arguments \
+                        '1:arquivo:_files' \
+                        '2:contexto:'
+                    ;;
+                bulk)
+                    _arguments \
+                        '-r[Recursivo]' \
+                        '-p[Paralelo]' \
+                        '1:diretório:_directories' \
+                        '2:instrução:'
+                    ;;
+                chunk)
+                    _arguments \
+                        '1:arquivo:_files' \
+                        '2:instrução:' \
+                        '3:chunk_lines:' \
+                        '4:overlap_lines:'
+                    ;;
+                pipe)
+                    _arguments '1:instrução:'
+                    ;;
+                diff)
+                    _arguments \
+                        '1:arquivo1:_files' \
+                        '2:arquivo2:_files' \
+                        '3:foco:'
+                    ;;
+                cache-clean|bench|stats|help)
+                    # Sem argumentos
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_gpu "$@"

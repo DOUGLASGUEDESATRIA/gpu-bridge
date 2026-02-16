@@ -32,6 +32,10 @@
 - **`--no-cache` global flag**: `gpu --no-cache <cmd>` forces reprocessing
 - **Differentiated exit codes**: 0=OK, 2=file, 3=ollama, 4=timeout, 5=usage (documented in help)
 
+### Improvement Round 3
+- **Zsh tab-completions**: `gpu sc<TAB>` → `scan`, file completions per command, flags
+- **`gpu bench`**: Quick benchmark — measures real tok/s with a short query
+
 ### Rating: 10/10
 
 ---
