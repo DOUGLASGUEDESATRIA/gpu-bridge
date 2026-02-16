@@ -53,3 +53,37 @@ Cada tipo de tarefa precisa de trade-off diferente:
 - **scan/vuln/diff (0.1)**: Precisa ser preciso mas pode variar formatação
 - **summarize/bulk (0.2)**: Precisa sintetizar, alguma liberdade
 - **ask (0.3)**: Conversa geral, mais liberdade criativa
+
+## Por que Auto-Chunk em vez de Rejeitar Arquivos Grandes?
+
+Filosofia v6.0: **a GPU nunca deve ficar ociosa**. Quando um arquivo não cabe no contexto de 32K tokens:
+
+1. **Opus fatia** — `gpu chunk` calcula chunks que cabem no contexto (~800 linhas com overlap de 50)
+2. **GPU processa em paralelo** — 2 workers simultâneos (`OLLAMA_NUM_PARALLEL=2`)
+3. **Resultados agregados** — com ranges de linhas reais para rastreabilidade
+
+Antes (v5.x): "arquivo grande → delega para Opus" (GPU ociosa).
+Agora (v6.0): "arquivo grande → Opus fatia → GPU processa tudo → Opus raciocina sobre resultado".
+
+O overlap entre chunks (50 linhas por padrão) garante que bugs em fronteiras não sejam perdidos.
+
+## Por que Pipeline (stdin→GPU→stdout)?
+
+`gpu pipe` permite composição Unix nativa:
+```bash
+gpu scan app.js "bugs" | gpu pipe "priorizar por severidade"
+cat crash.log | gpu pipe "extrair stack traces"
+```
+
+Isso transforma a GPU num filtro de texto inteligente — encaixável em qualquer pipeline existente.
+
+## Por que smart_extract Head+Middle+Tail?
+
+v3.0–v5.x usavam split 70/30 (head+tail). Problema: o meio do arquivo era sempre perdido.
+Muitos bugs e lógica crítica ficam no meio. v6.0 usa 40/30/30 (head+middle+tail):
+
+- **Head (40%)**: Imports, config, setup
+- **Middle (30%)**: Lógica core, funções principais
+- **Tail (30%)**: Error handlers, cleanup, exports
+
+Isso dá cobertura uniforme do arquivo sem duplicação.

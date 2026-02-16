@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# gpu v5.0 — Bridge Híbrida: Opus (cérebro) ↔ RTX 4090 (processamento)
+# gpu v6.0 — Bridge Híbrida: Opus (orquestrador) ↔ RTX 4090 (motor de processamento)
 # ============================================================================
 #
 # ARQUITETURA HÍBRIDA:
@@ -13,6 +13,14 @@
 #   • 32K context window ativo (256K nativo, 32K = sweet spot VRAM)
 #   • Override: GPU_MODEL=modelo gpu comando
 #
+# v6.0 Mudanças:
+#   - NEW: gpu chunk — auto-fatia arquivos grandes + processamento paralelo + agregação
+#   - NEW: gpu pipe — pipeline encadeado (stdin → GPU → stdout)
+#   - NEW: gpu bulk -p — modo paralelo (2 workers simultâneos)
+#   - FIX: smart_extract agora usa head+middle+tail (não perde o meio)
+#   - FIX: classify força output JSON via Ollama format parameter
+#   - FIX: ollama_query suporta $5=format (json)
+#
 # v5.0 Mudanças:
 #   - Context window: 8K → 32K (4x mais conteúdo, zero perda de speed)
 #   - Content limits: 2-3x maiores em todos os comandos
@@ -20,18 +28,18 @@
 #   - Cache expandido: scan, search-vuln, diff agora com cache
 #   - Temperature por comando (0.05 classify → 0.3 ask)
 #   - Retry automático (1x) em falhas transitórias
-#   - Fix: timer bug no classify cache hit
 #   - GPU Persistence Mode via systemd
-#   - Código morto removido (resolve_model inline)
 #
 # Modos:
 #   gpu ask "pergunta qualquer"              → resposta rápida
 #   gpu scan <arquivo> "o que procurar"      → varre arquivo
-#   gpu classify <arquivo>                   → classifica crash/log
+#   gpu classify <arquivo>                   → classifica crash/log (JSON forçado)
 #   gpu summarize <arquivo>                  → resume arquivo
 #   gpu triage <bugreport.zip|log>           → pipeline completo Android
 #   gpu search-vuln <arquivo> "contexto"     → auditoria segurança
-#   gpu bulk [-r] <pasta> "instrução"        → batch processing
+#   gpu chunk <arquivo> "instrução" [linhas] → auto-fatia + paralelo + agrega
+#   gpu bulk [-r] [-p] <pasta> "instrução"   → batch processing (-p = paralelo)
+#   gpu pipe "instrução"                     → pipeline encadeado stdin→GPU→stdout
 #   gpu diff <file1> <file2> "foco"          → compara arquivos
 #   gpu stats                                → status completo do sistema
 #
@@ -41,7 +49,7 @@
 set -euo pipefail
 
 # ─── Config ─────────────────────────────────────────────────────────────────
-VERSION="5.1"
+VERSION="6.0"
 KALI_SAFE="/mnt/winraid/__KALI_SAFE"
 export OLLAMA_MODELS="${KALI_SAFE}/models"
 HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
@@ -209,26 +217,44 @@ file_size_human() {
 
 # Extração inteligente de conteúdo:
 # - Arquivos pequenos: conteúdo completo
-# - Arquivos grandes: head + tail (para não perder o final)
+# - Arquivos grandes: head + middle + tail (3 seções para cobertura máxima)
 smart_extract() {
     local file="$1"
     local max_chars="${2:-$CHARS_MEDIUM}"
     local total_lines
+    local file_bytes
 
     total_lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+    file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
 
-    if (( $(stat -c%s "$file") <= max_chars )); then
+    if (( file_bytes <= max_chars )); then
         # Arquivo inteiro cabe
         cat "$file"
     else
-        # Split: 70% head, 30% tail
-        local head_chars=$(( max_chars * 70 / 100 ))
+        # Split: 40% head, 30% middle, 30% tail (não perde o core do arquivo)
+        local head_chars=$(( max_chars * 40 / 100 ))
+        local mid_chars=$(( max_chars * 30 / 100 ))
         local tail_chars=$(( max_chars * 30 / 100 ))
 
+        # Head: primeiras linhas (imports, setup, declarations)
         head -c "$head_chars" "$file"
         echo ""
         echo ""
-        echo "... [TRUNCATED — showing first ${head_chars} + last ${tail_chars} chars of ${total_lines} lines] ..."
+        echo "... [HEAD END — ${head_chars} chars] ..."
+        echo ""
+
+        # Middle: centro do arquivo (lógica core, funções principais)
+        local mid_start_byte=$(( (file_bytes - mid_chars) / 2 ))
+        echo "... [MIDDLE — starting at byte ${mid_start_byte} of ${file_bytes}] ..."
+        echo ""
+        dd if="$file" bs=4096 skip=$(( mid_start_byte / 4096 )) count=$(( (mid_chars + 4095) / 4096 )) 2>/dev/null | head -c "$mid_chars"
+        echo ""
+        echo ""
+        echo "... [MIDDLE END] ..."
+        echo ""
+
+        # Tail: últimas linhas (exports, main, cleanup)
+        echo "... [TAIL — last ${tail_chars} chars of ${total_lines} lines] ..."
         echo ""
         tail -c "$tail_chars" "$file"
     fi
@@ -262,38 +288,61 @@ cache_get() {
 cache_put() {
     local key="$1"
     local content="$2"
-    echo "$content" > "${CACHE_DIR}/${key}.txt" 2>/dev/null || true
+    printf '%s\n' "$content" > "${CACHE_DIR}/${key}.txt" 2>/dev/null || true
 }
 
 # Core query function — fix SIGPIPE capturando em variável
-# $1=system_prompt  $2=user_prompt  $3=num_predict  $4=temperature
+# $1=system_prompt  $2=user_prompt  $3=num_predict  $4=temperature  $5=format(json|"")
 ollama_query() {
     local system_prompt="$1"
     local user_prompt="$2"
     local num_predict="${3:-$PREDICT_MEDIUM}"
     local temperature="${4:-$TEMP_ANALYTICAL}"
+    local format="${5:-}"
 
-    log_dim "Modelo: ${MODEL} | ctx:${NUM_CTX} temp:${temperature}"
+    log_dim "Modelo: ${MODEL} | ctx:${NUM_CTX} temp:${temperature}$([ -n "$format" ] && echo " fmt:${format}")"
 
     local payload
-    payload=$(jq -n \
-        --arg model "$MODEL" \
-        --arg system "$system_prompt" \
-        --arg prompt "$user_prompt" \
-        --argjson predict "$num_predict" \
-        --argjson temp "$temperature" \
-        --argjson ctx "$NUM_CTX" \
-        '{
-            model: $model,
-            system: $system,
-            prompt: $prompt,
-            stream: false,
-            options: {
-                temperature: $temp,
-                num_predict: $predict,
-                num_ctx: $ctx
-            }
-        }')
+    if [[ "$format" == "json" ]]; then
+        payload=$(jq -n \
+            --arg model "$MODEL" \
+            --arg system "$system_prompt" \
+            --arg prompt "$user_prompt" \
+            --argjson predict "$num_predict" \
+            --argjson temp "$temperature" \
+            --argjson ctx "$NUM_CTX" \
+            '{
+                model: $model,
+                system: $system,
+                prompt: $prompt,
+                stream: false,
+                format: "json",
+                options: {
+                    temperature: $temp,
+                    num_predict: $predict,
+                    num_ctx: $ctx
+                }
+            }')
+    else
+        payload=$(jq -n \
+            --arg model "$MODEL" \
+            --arg system "$system_prompt" \
+            --arg prompt "$user_prompt" \
+            --argjson predict "$num_predict" \
+            --argjson temp "$temperature" \
+            --argjson ctx "$NUM_CTX" \
+            '{
+                model: $model,
+                system: $system,
+                prompt: $prompt,
+                stream: false,
+                options: {
+                    temperature: $temp,
+                    num_predict: $predict,
+                    num_ctx: $ctx
+                }
+            }')
+    fi
 
     # Retry loop — falhas transitórias (cold start, timeout)
     local attempt raw_response exit_code
@@ -435,12 +484,13 @@ cmd_classify() {
     _timer_start
     local result
     result=$(ollama_query \
-        'You classify crash/log/error snippets. Return ONLY valid JSON with this exact structure: {"type": "crash|error|warning|info|mixed", "severity": "critical|high|medium|low", "subsystem": "component name", "root_cause": "1 line", "summary": "1 line description", "actionable": true/false}' \
+        'You classify crash/log/error snippets. Return valid JSON with this exact structure: {"type": "crash|error|warning|info|mixed", "severity": "critical|high|medium|low", "subsystem": "component name", "root_cause": "1 line", "summary": "1 line description", "actionable": true/false}' \
         "Classify this file:
 
 ${content}" \
         "$PREDICT_SMALL" \
-        "$TEMP_DETERMINISTIC")
+        "$TEMP_DETERMINISTIC" \
+        "json")
     echo "$result"
     [[ -n "$result" ]] && cache_put "$ckey" "$result"
     _timer_end
@@ -567,17 +617,21 @@ ${content}
 
 cmd_bulk() {
     local recursive=false
-    # Parse -r flag
-    if [[ "${1:-}" == "-r" ]]; then
-        recursive=true
-        shift
-    fi
+    local parallel=false
+    # Parse flags
+    while [[ "${1:-}" == -* ]]; do
+        case "$1" in
+            -r) recursive=true; shift ;;
+            -p) parallel=true; shift ;;
+            *) break ;;
+        esac
+    done
 
     local dir="${1:-}"
-    [[ -z "$dir" ]] && { log_err "Uso: gpu bulk [-r] <dir> \"instrução\""; exit 1; }
+    [[ -z "$dir" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit 1; }
     shift
     local instruction="$*"
-    [[ -z "$instruction" ]] && { log_err "Uso: gpu bulk [-r] <dir> \"instrução\""; exit 1; }
+    [[ -z "$instruction" ]] && { log_err "Uso: gpu bulk [-r] [-p] <dir> \"instrução\""; exit 1; }
 
     require_dir "$dir"
     ensure_ollama
@@ -603,52 +657,247 @@ cmd_bulk() {
         done
     fi
 
-    local total=${#files[@]}
-    log_info "Found ${total} files in $(basename "$dir") $(${recursive} && echo '(recursive)' || echo '')"
-
+    # Filtra binários e vazios antecipadamente
+    local valid_files=()
     for f in "${files[@]}"; do
-        # Skip binários
         if is_binary "$f"; then
             ((skipped++))
             log_dim "Skip (binary): $(basename "$f")"
-            continue
-        fi
-
-        # Skip arquivos vazios
-        if [[ ! -s "$f" ]]; then
+        elif [[ ! -s "$f" ]]; then
             ((skipped++))
             log_dim "Skip (empty): $(basename "$f")"
-            continue
+        else
+            valid_files+=("$f")
         fi
+    done
 
-        ((count++))
-        local relpath="${f#$dir/}"
-        log_info "[${count}/${total}] Processing: ${relpath}"
+    local total=${#valid_files[@]}
+    log_info "Found ${total} processable files in $(basename "$dir") $(${recursive} && echo '(recursive)' || echo '')"
 
-        echo "### ${relpath}"
-        echo ""
+    if $parallel && (( total > 1 )); then
+        # ── Parallel mode: 2 requests simultâneos (usa OLLAMA_NUM_PARALLEL=2) ──
+        log_info "⚡ Parallel mode: 2 workers"
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        trap "rm -rf '$tmpdir'" EXIT
 
-        local content
-        content=$(smart_extract "$f" "$CHARS_BULK")
+        local running=0
+        local idx=0
 
-        ollama_query \
-            "You process files according to instructions. Be concise and structured." \
-            "Instruction: ${instruction}
+        for f in "${valid_files[@]}"; do
+            ((idx++))
+            local relpath="${f#$dir/}"
+            local outfile="${tmpdir}/result_$(printf '%04d' $idx).md"
+            local content
+            content=$(smart_extract "$f" "$CHARS_BULK")
+
+            log_info "[${idx}/${total}] Dispatching: ${relpath}"
+
+            # Lança em background
+            (
+                local r
+                r=$(ollama_query \
+                    "You process files according to instructions. Be concise and structured." \
+                    "Instruction: ${instruction}
 
 --- FILE: ${relpath} ($(file_size_human "$f")) ---
 ${content}
 --- END ---" \
-            "$PREDICT_BULK" \
-            "$TEMP_BALANCED"
+                    "$PREDICT_BULK" \
+                    "$TEMP_BALANCED" 2>/dev/null)
+                {
+                    echo "### ${relpath}"
+                    echo ""
+                    echo "$r"
+                    echo ""
+                    echo "---"
+                    echo ""
+                } > "$outfile"
+            ) &
 
-        echo ""
-        echo "---"
-        echo ""
-    done
+            ((running++))
+
+            # Espera quando atingir 2 paralelos
+            if (( running >= 2 )); then
+                wait -n 2>/dev/null || true
+                ((running--))
+            fi
+        done
+
+        # Espera todos terminarem
+        wait
+
+        # Output ordenado
+        for outfile in "$tmpdir"/result_*.md; do
+            [[ -f "$outfile" ]] && cat "$outfile"
+        done
+        count=$total
+    else
+        # ── Sequential mode (default) ──
+        for f in "${valid_files[@]}"; do
+            ((count++))
+            local relpath="${f#$dir/}"
+            log_info "[${count}/${total}] Processing: ${relpath}"
+
+            echo "### ${relpath}"
+            echo ""
+
+            local content
+            content=$(smart_extract "$f" "$CHARS_BULK")
+
+            ollama_query \
+                "You process files according to instructions. Be concise and structured." \
+                "Instruction: ${instruction}
+
+--- FILE: ${relpath} ($(file_size_human "$f")) ---
+${content}
+--- END ---" \
+                "$PREDICT_BULK" \
+                "$TEMP_BALANCED"
+
+            echo ""
+            echo "---"
+            echo ""
+        done
+    fi
 
     echo ""
     echo "**Total**: ${count} processed, ${skipped} skipped"
     log_ok "Bulk complete: ${count} processed, ${skipped} skipped"
+    _timer_end
+}
+
+cmd_chunk() {
+    # Auto-chunk: fatia arquivo grande, processa cada chunk na GPU em paralelo, agrega
+    local file="${1:-}"
+    [[ -z "$file" ]] && { log_err "Uso: gpu chunk <arquivo> \"instrução\" [chunk_lines]"; exit 1; }
+    shift
+    local instruction="${1:-analyze this code for bugs, security issues, and code smells}"
+    shift 2>/dev/null || true
+    local chunk_lines="${1:-800}"
+    local overlap_lines=50
+
+    require_file "$file"
+    ensure_ollama
+
+    local size total_lines
+    size=$(file_size_human "$file")
+    total_lines=$(wc -l < "$file")
+
+    log_info "Chunk processing: $(basename "$file") (${size}, ${total_lines}L)"
+    log_info "Strategy: ${chunk_lines}L chunks, ${overlap_lines}L overlap, parallel=2"
+
+    # Se cabe inteiro → manda direto sem chunking
+    if (( $(stat -c%s "$file") <= CHARS_MEDIUM )); then
+        log_info "File fits in context window — processing directly"
+        cmd_scan "$file" "$instruction"
+        return $?
+    fi
+
+    _timer_start
+
+    # Cria chunks com overlap
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    trap "rm -rf '$tmpdir'" EXIT
+
+    local chunk_num=0
+    local start_line=1
+
+    while (( start_line <= total_lines )); do
+        ((chunk_num++))
+        local end_line=$(( start_line + chunk_lines - 1 ))
+        (( end_line > total_lines )) && end_line=$total_lines
+
+        local chunk_file="${tmpdir}/chunk_$(printf '%03d' $chunk_num).txt"
+        sed -n "${start_line},${end_line}p" "$file" > "$chunk_file"
+
+        # Prepend header com contexto de posição
+        local header="[CHUNK ${chunk_num} | Lines ${start_line}-${end_line} of ${total_lines} | File: $(basename "$file")]"
+        local tmp_with_header="${tmpdir}/h_$(printf '%03d' $chunk_num).txt"
+        {
+            echo "$header"
+            echo ""
+            cat "$chunk_file"
+        } > "$tmp_with_header"
+        mv "$tmp_with_header" "$chunk_file"
+
+        # Salva range real para uso na agregação
+        echo "${start_line} ${end_line}" > "${tmpdir}/range_$(printf '%03d' $chunk_num).txt"
+
+        # Se chegou ao fim do arquivo, para
+        (( end_line >= total_lines )) && break
+
+        # Próximo chunk começa overlap_lines antes do fim (para contexto)
+        start_line=$(( end_line - overlap_lines + 1 ))
+    done
+
+    local num_chunks=$chunk_num
+    log_info "Split into ${num_chunks} chunks, processing with 2 parallel workers..."
+
+    echo "## Chunk Analysis: $(basename "$file")"
+    echo "**File**: ${size}, ${total_lines} lines"
+    echo "**Chunks**: ${num_chunks} (${chunk_lines}L each, ${overlap_lines}L overlap)"
+    echo "**Instruction**: ${instruction}"
+    echo ""
+
+    # Processa chunks em paralelo (2 workers)
+    local running=0
+    for i in $(seq 1 "$num_chunks"); do
+        local chunk_file="${tmpdir}/chunk_$(printf '%03d' $i).txt"
+        local result_file="${tmpdir}/result_$(printf '%03d' $i).md"
+
+        log_info "[${i}/${num_chunks}] Dispatching chunk"
+
+        (
+            local content
+            content=$(cat "$chunk_file")
+            local r
+            r=$(ollama_query \
+                "You are analyzing a CHUNK of a larger file. The chunk header tells you the exact line range. Be precise with line numbers relative to the ORIGINAL file. If a finding spans a chunk boundary, note it. Format findings as a structured list." \
+                "Instruction: ${instruction}
+
+--- CHUNK CONTENT ---
+${content}
+--- END CHUNK ---" \
+                "$PREDICT_MEDIUM" \
+                "$TEMP_ANALYTICAL" 2>/dev/null)
+            echo "$r" > "$result_file"
+        ) &
+
+        ((running++))
+        if (( running >= 2 )); then
+            wait -n 2>/dev/null || true
+            ((running--))
+        fi
+    done
+    wait
+
+    # Agrega resultados ordenados
+    for i in $(seq 1 "$num_chunks"); do
+        local result_file="${tmpdir}/result_$(printf '%03d' $i).md"
+        if [[ -f "$result_file" && -s "$result_file" ]]; then
+            local range_file="${tmpdir}/range_$(printf '%03d' $i).txt"
+            local start_l end_l
+            if [[ -f "$range_file" ]]; then
+                read -r start_l end_l < "$range_file"
+            else
+                start_l="?"
+                end_l="?"
+            fi
+            echo "### Chunk ${i} (Lines ${start_l}–${end_l})"
+            echo ""
+            cat "$result_file"
+            echo ""
+            echo "---"
+            echo ""
+        fi
+    done
+
+    echo ""
+    echo "**Summary**: ${num_chunks} chunks processed from ${total_lines} lines"
+    echo "**Note**: Opus should now cross-reference and deduplicate findings across chunks"
+    log_ok "Chunk analysis complete: ${num_chunks} chunks"
     _timer_end
 }
 
@@ -693,6 +942,51 @@ ${content2}
         "$TEMP_ANALYTICAL")
     echo "$result"
     [[ -n "$result" ]] && cache_put "$ckey" "$result"
+    _timer_end
+}
+
+cmd_pipe() {
+    # Pipeline encadeado: stdin do pipe anterior → processamento GPU → stdout
+    # Uso: gpu scan file "bugs" | gpu pipe "priorize por severidade" | gpu pipe "sugira fixes"
+    # Uso: cat findings.txt | gpu pipe "classifique cada finding"
+    local instruction="$*"
+    [[ -z "$instruction" ]] && { log_err "Uso: echo 'data' | gpu pipe \"instrução\""; exit 1; }
+
+    # Lê stdin (output do comando anterior)
+    local stdin_data
+    if [[ -t 0 ]]; then
+        log_err "gpu pipe espera input via stdin (pipe)"
+        log_err "Exemplo: gpu scan file.js \"bugs\" | gpu pipe \"priorize\""
+        exit 1
+    fi
+    stdin_data=$(cat)
+
+    if [[ -z "$stdin_data" ]]; then
+        log_err "stdin vazio — nada para processar"
+        exit 1
+    fi
+
+    local input_size=${#stdin_data}
+    # Trunca se excede contexto
+    if (( input_size > CHARS_MEDIUM )); then
+        log_warn "Input truncado: ${input_size} → ${CHARS_MEDIUM} chars"
+        stdin_data="${stdin_data:0:$CHARS_MEDIUM}"
+    fi
+
+    ensure_ollama
+
+    log_info "Pipe: ${instruction:0:60}... (${input_size} chars input)"
+
+    _timer_start
+    ollama_query \
+        "You are part of a processing pipeline. Your input is the output from a previous analysis step. Process it according to the instruction and output a clean, structured result that can be consumed by the next step or by a human." \
+        "Instruction: ${instruction}
+
+--- INPUT FROM PREVIOUS STEP ---
+${stdin_data}
+--- END INPUT ---" \
+        "$PREDICT_LARGE" \
+        "$TEMP_ANALYTICAL"
     _timer_end
 }
 
@@ -798,23 +1092,27 @@ case "$CMD" in
     triage)       cmd_triage "$@" ;;
     search-vuln)  cmd_search_vuln "$@" ;;
     bulk)         cmd_bulk "$@" ;;
+    chunk)        cmd_chunk "$@" ;;
+    pipe)         cmd_pipe "$@" ;;
     diff)         cmd_diff "$@" ;;
     stats)        cmd_stats ;;
     -v|--version) echo "gpu v${VERSION}" ;;
     -h|--help|help|"")
         echo -e "${C_BOLD}gpu v${VERSION}${C_RESET} — Bridge Híbrida Opus↔RTX4090"
         echo ""
-        echo -e "${C_CYAN}Arquitetura:${C_RESET}  Opus raciocina → GPU executa → Opus lê → Opus decide"
+        echo -e "${C_CYAN}Arquitetura:${C_RESET}  Opus organiza → GPU processa → Opus raciocina"
         echo -e "${C_CYAN}Modelo:${C_RESET}       Qwen3-Coder-30B-MoE abliterated (178 tok/s, zero censura)"
         echo ""
         echo -e "${C_CYAN}Comandos:${C_RESET}"
         echo "  gpu ask \"pergunta\"                   Pergunta rápida"
         echo "  gpu scan <file> \"query\"              Varre arquivo"
-        echo "  gpu classify <file>                  Classifica crash/log"
+        echo "  gpu classify <file>                  Classifica crash/log (JSON forçado)"
         echo "  gpu summarize <file>                 Resume arquivo grande"
         echo "  gpu triage <bugreport.zip|log>       Pipeline completo Android"
         echo "  gpu search-vuln <file> \"contexto\"    Auditoria de segurança"
-        echo "  gpu bulk [-r] <dir> \"instrução\"      Processa pasta inteira"
+        echo "  gpu bulk [-r] [-p] <dir> \"instrução\" Processa pasta (-p = paralelo)"
+        echo "  gpu chunk <file> \"instrução\" [lines] Auto-fatia + paralelo + agrega"
+        echo "  gpu pipe \"instrução\"                 Pipeline: stdin → GPU → stdout"
         echo "  gpu diff <f1> <f2> \"foco\"            Compara dois arquivos"
         echo "  gpu stats                            Status do sistema"
         echo ""
@@ -823,7 +1121,9 @@ case "$CMD" in
         echo "  gpu scan crash.log \"null pointer\""
         echo "  gpu summarize /var/log/syslog"
         echo "  gpu search-vuln app.py \"REST API\""
-        echo "  gpu bulk -r src/ \"find TODO comments\""
+        echo "  gpu bulk -r -p src/ \"find TODO comments\""
+        echo "  gpu chunk bigfile.js \"find bugs\" 800"
+        echo "  gpu scan file.js \"bugs\" | gpu pipe \"priorize por severidade\""
         echo "  gpu diff old.conf new.conf \"security changes\""
         echo ""
         echo -e "${C_CYAN}Env:${C_RESET}"

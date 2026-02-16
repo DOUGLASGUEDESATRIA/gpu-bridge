@@ -1,6 +1,6 @@
-# GPU Hybrid Bridge v5.1
+# GPU Hybrid Bridge v6.0
 
-**Sistema híbrido Opus↔RTX 4090** — Copilot (Opus) raciocina, GPU local executa.
+**Sistema híbrido Opus↔RTX 4090** — Opus orquestra e fatia, GPU processa a 180 tok/s.
 
 ## Arquitetura
 
@@ -8,12 +8,17 @@
 ┌─────────────┐     ┌─────────────┐     ┌──────────────────┐
 │  Copilot     │────▶│  gpu CLI    │────▶│  Ollama + RTX    │
 │  (Opus)      │◀────│  bridge     │◀────│  4090 (24GB)     │
-│  = cérebro   │     │  = terminal │     │  = processamento │
+│  = orquestra │     │  = terminal │     │  = processamento │
 └─────────────┘     └─────────────┘     └──────────────────┘
+        │                                        ▲
+        │     ┌──────────────────────────┐       │
+        └────▶│  chunk / pipe / bulk -p  │───────┘
+              │  = paralelismo + fatia   │
+              └──────────────────────────┘
 ```
 
-O Opus lê outputs compactos e aplica raciocínio profundo.
-A GPU processa trabalho bruto a 180 tok/s sem censura.
+Opus organiza → GPU processa (180 tok/s) → Opus raciocina.
+Qualquer arquivo, qualquer tamanho — Opus fatia, GPU processa em paralelo.
 
 ## Hardware
 
@@ -33,7 +38,7 @@ A GPU processa trabalho bruto a 180 tok/s sem censura.
 | Tipo | MoE — 30B total, 3.3B ativos/token, 128 experts |
 | Quantização | Q4_K_M (18GB download, ~23GB VRAM loaded) |
 | Velocidade | ~180 tok/s |
-| Contexto | 32768 tokens |
+| Contexto | 32768 tokens (~112KB) |
 | Censura | Zero (abliterated — pesos modificados no nível dos weights) |
 
 ## Comandos
@@ -41,14 +46,24 @@ A GPU processa trabalho bruto a 180 tok/s sem censura.
 ```bash
 gpu ask "pergunta"                    # Pergunta rápida (~0.5s)
 gpu scan <file> "query"               # Varre arquivo por padrão
-gpu classify <file>                   # Classifica crash/log → JSON
+gpu classify <file>                   # Classifica crash/log → JSON puro
 gpu summarize <file>                  # Resume arquivo grande
 gpu triage <bugreport.zip|log>        # Pipeline Android completo
 gpu search-vuln <file> "contexto"     # Auditoria de segurança
-gpu bulk [-r] <dir> "instrução"       # Processa pasta inteira
+gpu bulk [-r] [-p] <dir> "instrução"  # Processa pasta (-p = paralelo)
 gpu diff <f1> <f2> "foco"             # Compara dois arquivos
+gpu chunk <file> "instrução"          # Auto-fatia + paralelo + agrega
+gpu pipe "instrução"                  # stdin→GPU→stdout (chainable)
 gpu stats                             # Status do sistema
 ```
+
+### Novos em v6.0
+
+| Comando | Descrição |
+|---------|-----------|
+| `gpu chunk` | Auto-fatia arquivos grandes com overlap, processa chunks em paralelo, agrega resultados |
+| `gpu pipe` | stdin→GPU→stdout — permite encadear: `gpu scan f \| gpu pipe "resumir"` |
+| `gpu bulk -p` | Modo paralelo: 2 workers simultâneos via `OLLAMA_NUM_PARALLEL=2` |
 
 ## Instalação
 
@@ -96,7 +111,7 @@ cp config/copilot-instructions.md /mnt/winraid/__KALI_SAFE/copilot-instructions.
 gpu-hybrid-bridge/
 ├── README.md                          # Este arquivo
 ├── scripts/
-│   └── gpu                            # Bridge script v5.1 (824 linhas)
+│   └── gpu                            # Bridge script v6.0 (1140 linhas)
 ├── config/
 │   ├── copilot-instructions.md        # Instruções globais pro Copilot
 │   ├── ollama-override.conf           # Systemd override (performance)
@@ -124,7 +139,7 @@ gpu-hybrid-bridge/
 | Tipo | Temp | Comandos |
 |------|------|----------|
 | Deterministic | 0.05 | classify |
-| Analytical | 0.10 | scan, search-vuln, diff |
+| Analytical | 0.10 | scan, search-vuln, diff, chunk, pipe |
 | Balanced | 0.20 | summarize, bulk |
 | Creative | 0.30 | ask |
 
@@ -138,6 +153,7 @@ gpu-hybrid-bridge/
 | v4.0 | — | Single model (30B MoE), limpeza |
 | v5.0 | — | 32K ctx, KEEP_ALIVE=-1, retry, temperatures, cache expansion |
 | v5.1 | Feb 2026 | Cache guard, validate_model integrado, binary rejection, dynamic stats |
+| v6.0 | Feb 2026 | Auto-chunk, pipe, bulk paralelo, smart_extract head+mid+tail, classify JSON |
 
 ## Sessão Já Iniciada
 

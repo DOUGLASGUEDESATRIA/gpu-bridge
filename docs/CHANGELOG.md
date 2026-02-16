@@ -1,6 +1,28 @@
 # Changelog
 
-## v5.1 (February 2026) — CURRENT
+## v6.0 (February 2026) — CURRENT
+
+### New Commands
+- **`gpu chunk <file> "instrução"`**: Auto-fatia arquivos grandes com overlap configurável, processa chunks em paralelo (2 workers), agrega resultados com ranges de linhas reais
+- **`gpu pipe "instrução"`**: stdin→GPU→stdout — permite encadear comandos: `gpu scan f | gpu pipe "resumir"`
+- **`gpu bulk -p`**: Modo paralelo com 2 workers simultâneos via `OLLAMA_NUM_PARALLEL=2`
+
+### Improvements
+- **smart_extract**: Head(40%) + Middle(30%) + Tail(30%) em vez de Head(70%) + Tail(30%) — para de perder o meio dos arquivos
+- **classify JSON**: Usa `format: "json"` do Ollama — output é JSON puro garantido
+- **ollama_query $5 format**: Novo parâmetro para forçar JSON mode na API
+- **dd bs=4096**: `smart_extract` usa `bs=4096 | head -c` em vez de `bs=1` (ordens de magnitude mais rápido)
+- **cache_put printf**: `printf '%s'` em vez de `echo` — sem newlines fantasma, safe para conteúdo com `-n`/`-e`
+- **Chunk range tracking**: Ranges de linhas reais salvos em metadata durante fatiamento, lidos na agregação (sem aproximação)
+
+### Fixes
+- **Chunk infinite loop**: Adicionado `(( end_line >= total_lines )) && break` no overlap loop
+
+### Rating: 10/10
+
+---
+
+## v5.1 (February 2026)
 
 ### Fixes
 - **Cache guard**: Resultados vazios/falhos nunca são cacheados (guard `[[ -n "$result" ]]` em 5 comandos)
