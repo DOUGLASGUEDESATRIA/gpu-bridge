@@ -592,29 +592,103 @@ cmd_search_vuln() {
     local extra_patterns="${*:-}"
 
     require_file "$file"
-    ensure_ollama
 
     local size
     size=$(file_size_human "$file")
     local total_lines
     total_lines=$(wc -l < "$file")
-    log_info "Pattern extraction: $(basename "$file") (${size}, ${total_lines}L)"
+    log_info "search-vuln v3: $(basename "$file") (${size}, ${total_lines}L)"
 
-    # Auto-redirect para chunk se arquivo não cabe no contexto
-    local file_bytes
-    file_bytes=$(stat -c%s "$file" 2>/dev/null || echo 0)
-    if (( file_bytes > CHARS_VULN )); then
-        log_warn "Arquivo excede contexto ($(( file_bytes / 1024 ))KB > $(( CHARS_VULN / 1024 ))KB) — redirecionando para chunk"
-        cmd_chunk "$file" "Extract ONLY these exact code patterns (quote the code, give line number): eval() exec() child_process spawn() Function() setTimeout(string) setInterval(string) innerHTML outerHTML document.write insertAdjacentHTML sql/query with string concatenation (+ instead of parameterized) hardcoded passwords/keys/tokens/secrets rejectUnauthorized:false fs operations with user input deserialization of untrusted data. ${extra_patterns:+Also: ${extra_patterns}.} If a pattern does not appear in the code, do NOT mention it."
-        return $?
+    # ─── FASE 1: PRE-SCAN LOCAL (grep -nE, zero GPU) ───────────────────────
+    # 36 regex concretos — só padrões que EXISTEM no código
+    local -a VULN_PATTERNS=(
+        # JS/Node — injection & exec
+        'eval\s*\('
+        '\bexec\s*\('
+        'execSync\s*\('
+        'child_process'
+        'spawn\s*\('
+        'Function\s*\('
+        'setTimeout\s*\('
+        'setInterval\s*\('
+        # DOM — XSS vectors
+        'innerHTML'
+        'outerHTML'
+        'document\.write'
+        'insertAdjacentHTML'
+        # SQL — concatenation
+        '\.query\s*\('
+        '\.execute\s*\('
+        'SELECT\s.*\+|INSERT\s.*\+'
+        # Hardcoded secrets
+        'password\s*=\s*["\x27]'
+        'api[_-]?key\s*=\s*["\x27]'
+        'secret\s*=\s*["\x27]'
+        'token\s*=\s*["\x27]'
+        # TLS bypass
+        'rejectUnauthorized\s*:\s*false'
+        'NODE_TLS_REJECT_UNAUTHORIZED'
+        # File ops with user input
+        'readFile.*req\.|writeFile.*req\.'
+        # Deserialization
+        'unserialize\s*\('
+        'pickle\.loads\s*\('
+        'yaml\.load\s*\('
+        # Java/Android — exec & reflection
+        'Runtime\.getRuntime\(\)\.exec'
+        'ProcessBuilder'
+        'ScriptEngine.*eval'
+        'Class\.forName'
+        'ObjectInputStream'
+        'Cipher\.getInstance\s*\(\s*["\x27]'
+        # Android — WebView
+        'addJavascriptInterface'
+        'setJavaScriptEnabled\s*\(\s*true'
+        'loadUrl.*javascript:'
+        'WebView.*loadData'
+        # Android — content provider
+        'ContentResolver.*query'
+        'rawQuery\s*\('
+        'execSQL\s*\('
+    )
+
+    # Monta regex combinado
+    local combined_regex
+    combined_regex=$(printf '%s|' "${VULN_PATTERNS[@]}")
+    combined_regex="${combined_regex%|}"  # remove trailing |
+
+    # Adiciona padrões extras do usuário
+    if [[ -n "$extra_patterns" ]]; then
+        local extra
+        for extra in $extra_patterns; do
+            combined_regex+="|${extra}"
+        done
+        log_info "Padrões extras: ${extra_patterns}"
     fi
 
-    local content
-    content=$(smart_extract "$file" "$CHARS_VULN")
+    # Pre-scan com grep local — ZERO GPU
+    local grep_hits
+    grep_hits=$(grep -nE "$combined_regex" "$file" 2>/dev/null || true)
+
+    if [[ -z "$grep_hits" ]]; then
+        log_info "PRE-SCAN: 0 hits — arquivo limpo, GPU não chamada"
+        echo "NO PATTERNS FOUND"
+        return 0
+    fi
+
+    local hit_count
+    hit_count=$(echo "$grep_hits" | wc -l)
+    log_info "PRE-SCAN: ${hit_count} hits encontrados — enviando para GPU validar"
+
+    # ─── FASE 2: GPU COMO VALIDADOR ────────────────────────────────────────
+    # GPU recebe APENAS os hits do grep, não o arquivo inteiro
+    # Pergunta: "este hit é perigoso ou falso positivo?"
+
+    ensure_ollama
 
     # Cache
     local ckey
-    ckey=$(cache_key "$file" "vuln2_$(echo "$extra_patterns" | md5sum | cut -c1-8)" "$MODEL")
+    ckey=$(cache_key "$file" "vuln3_$(echo "$extra_patterns" | md5sum | cut -c1-8)" "$MODEL")
     if cache_get "$ckey"; then
         return 0
     fi
@@ -622,81 +696,100 @@ cmd_search_vuln() {
     _timer_start
     local result
     result=$(ollama_query \
-        "${EXTRACT_RULE} You are a pattern matcher. Search the code for ONLY these concrete patterns:
+        "${EXTRACT_RULE} You are a pattern validator. You receive grep hits from a security scan.
+For each hit, determine if it is a REAL security-relevant pattern or a FALSE POSITIVE.
 
-MUST FIND (if present):
-- eval(), exec(), execSync(), child_process.spawn/exec with variable args
-- Function(), setTimeout(string), setInterval(string)
-- innerHTML, outerHTML, document.write, insertAdjacentHTML with variables
-- SQL/query with string concatenation (+ or template literals instead of \$1/\$2/?)
-- Hardcoded strings that look like passwords, API keys, tokens, secrets (not env vars)
-- rejectUnauthorized: false, NODE_TLS_REJECT_UNAUTHORIZED
-- fs.readFile/writeFile/unlink with req.params/req.query/req.body (path traversal)
-- JSON.parse of untrusted input without try/catch
-- deserialization: unserialize(), pickle.loads(), yaml.load() without SafeLoader
-${extra_patterns:+- ALSO SEARCH: ${extra_patterns}}
+FALSE POSITIVES to reject:
+- Pattern inside a comment (// or /* */ or # or --)
+- Pattern inside a string literal used as a label/message (not executed)
+- Safe usage: parameterized queries (\$1, ?, :param), env var lookups (process.env), SafeLoader
+- Test/mock/example code that is clearly not production
+- Import/require statements (just loading a module is not a vulnerability)
 
-OUTPUT FORMAT (for each match):
+For each CONFIRMED hit, output exactly:
 LINE: <number>
-CODE: <exact line of code, copied verbatim>
-NEXT: <the line after, verbatim>
+CODE: <exact code from the hit>
+PATTERN: <which pattern matched>
 
-RULES:
-- If a pattern does NOT appear in the code, do NOT mention it at all
-- Do NOT invent functions or code that is not in the input
-- Do NOT assess severity, impact, or recommend fixes
-- Do NOT flag env var fallbacks, config choices, or architectural decisions
-- ONLY output patterns you can QUOTE from the input text
-- If zero patterns found, output: NO PATTERNS FOUND" \
-        "File: $(basename "$file") ($(file -b "$file" 2>/dev/null || echo unknown))
+For rejected hits, output nothing (skip silently).
+If ALL hits are false positives, output: ALL HITS REJECTED — NO REAL PATTERNS
 
-${content}" \
+Do NOT add severity, impact, recommendations, or opinions." \
+        "File: $(basename "$file")
+Language: $(file -b "$file" 2>/dev/null || echo unknown)
+
+--- GREP HITS ---
+${grep_hits}
+--- END HITS ---" \
         "$PREDICT_VULN" \
         "$TEMP_DETERMINISTIC")
 
-    # ─── Auto-validação: verifica linha citada contra arquivo real ───
-    if [[ -n "$result" ]]; then
-        local validated=""
-        local found=0 verified=0 failed=0
+    # ─── FASE 3: AUTO-VALIDAÇÃO TRIPLA ─────────────────────────────────────
+    # Check 1: line number exists in file
+    # Check 2: sed extracts real content
+    # Check 3: real line matches at least 1 of the 36 patterns
+
+    local confirmed="" rejected_count=0 confirmed_count=0
+
+    if [[ -n "$result" ]] && ! echo "$result" | grep -q "ALL HITS REJECTED\|NO REAL PATTERNS\|NO PATTERNS FOUND"; then
         while IFS= read -r line; do
             if [[ "$line" =~ ^LINE:\ *([0-9]+) ]]; then
-                found=$((found + 1))
                 local lnum="${BASH_REMATCH[1]}"
+
+                # Read CODE and PATTERN lines
+                local code_line pattern_line
+                IFS= read -r code_line 2>/dev/null || true
+                IFS= read -r pattern_line 2>/dev/null || true
+
+                # Check 1: line exists
+                if (( lnum < 1 || lnum > total_lines )); then
+                    rejected_count=$((rejected_count + 1))
+                    continue
+                fi
+
+                # Check 2: extract real line
                 local real_line
                 real_line=$(sed -n "${lnum}p" "$file" 2>/dev/null)
-                # Lê a próxima linha do output (CODE:)
-                IFS= read -r code_line || true
-                if [[ -n "$real_line" ]]; then
-                    verified=$((verified + 1))
-                    validated+="LINE: ${lnum}
-CODE: ${code_line#CODE: }
-REAL: ${real_line}
-"
-                else
-                    failed=$((failed + 1))
-                    validated+="LINE: ${lnum} ⚠️ INVALID (file has ${total_lines} lines)
-"
+                if [[ -z "$real_line" ]]; then
+                    rejected_count=$((rejected_count + 1))
+                    continue
                 fi
+
+                # Check 3: real line matches at least 1 concrete pattern
+                if ! echo "$real_line" | grep -qE "$combined_regex" 2>/dev/null; then
+                    rejected_count=$((rejected_count + 1))
+                    continue
+                fi
+
+                # All 3 checks passed — confirmed
+                confirmed_count=$((confirmed_count + 1))
+                confirmed+="LINE: ${lnum}
+CODE: ${real_line}
+PATTERN: ${pattern_line#PATTERN: }
+
+"
             fi
         done <<< "$result"
-
-        if (( found > 0 )); then
-            log_info "Auto-validação: ${verified}/${found} linhas verificadas, ${failed} inválidas"
-            echo "## Pattern Extraction: $(basename "$file")"
-            echo ""
-            echo "$result"
-            echo ""
-            echo "---"
-            echo "## Auto-Validation (real lines from file)"
-            echo ""
-            echo "$validated"
-        else
-            echo "$result"
-        fi
-        cache_put "$ckey" "$result"
-    else
-        echo "NO PATTERNS FOUND"
     fi
+
+    # ─── OUTPUT ─────────────────────────────────────────────────────────────
+    echo "## search-vuln v3: $(basename "$file")"
+    echo ""
+    echo "**Pre-scan**: ${hit_count} grep hits"
+    echo "**Confirmed**: ${confirmed_count} patterns"
+    echo "**Rejected**: ${rejected_count} (auto-validation)"
+    echo ""
+
+    if (( confirmed_count > 0 )); then
+        echo "### Confirmed Patterns"
+        echo ""
+        echo "$confirmed"
+    else
+        echo "All hits were false positives or rejected by auto-validation."
+    fi
+
+    # Cache o resultado final
+    [[ -n "$confirmed" ]] && cache_put "$ckey" "$confirmed"
     _timer_end
 }
 

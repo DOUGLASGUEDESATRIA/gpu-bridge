@@ -75,7 +75,7 @@ manda pra GPU, e **analisa o resultado ele mesmo**.
 | Cenário | Comando | Opus faz | GPU faz |
 |---------|---------|----------|---------|
 | Buscar bugs | `gpu scan f "patterns"` | Define query, analisa output | Extrai ocorrências |
-| Auditoria segurança | `gpu search-vuln f "extras"` | Prioriza por CVSS, decide ação | Extrai padrões concretos (eval, SQL concat...) |
+| Auditoria segurança | `gpu search-vuln f "extras"` | Analisa confirmed patterns | Fase 1: grep local (36 regex) → Fase 2: GPU valida hits → Fase 3: auto-validação tripla |
 | Arquivo grande | `gpu chunk f "query"` | Agrega, deduplica, cruza | Extrai de cada chunk |
 | Log/crash | `gpu classify f` | Decide ação baseado no JSON | Classifica → JSON |
 | Resumir | `gpu summarize f` | Analisa outline, decide foco | Condensa em outline |
@@ -85,7 +85,7 @@ manda pra GPU, e **analisa o resultado ele mesmo**.
 ### Pipeline exemplo: auditoria completa
 ```bash
 # GPU extrai padrões → Opus analisa → GPU transforma resultado
-gpu search-vuln api.js "ssrf pickle"     # GPU extrai: eval(), SQL concat, etc (com auto-validação)
+gpu search-vuln api.js "ssrf pickle"     # Fase 1: grep 36 regex → Fase 2: GPU valida → Fase 3: auto-validação
 # Opus lê output, prioriza por severidade, cruza com contexto do projeto
 gpu pipe "filtrar só os de injection"     # GPU filtra subset
 # Opus analisa, decide quais corrigir, escreve os fixes
